@@ -4,7 +4,7 @@
 .env.*.local
 
 # Credentials Firebase
-*service-account*.json
+*service-account.json
 firebase-adminsdk-*.json
 
 # Cache Python
