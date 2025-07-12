@@ -1,0 +1,3 @@
+id,email,emailVerified,password,uid,provider,profilePic,phoneNumber,phoneVerified,name,city,birthdate,photo,createdAt,updatedAt,status,interests,lastConnexion
+BUlHZ8ahCpqVkB2iOmY3,john1.doe@example.com,False,,,CREDENTIALS,,,False,John Doe,,,,2025-07-11 18:39:14.158474+00:00,2025-07-12 19:10:31.660420,ACTIVE,,
+VN31a8ZmTXgKQEsHgbd6,john12.doe@example.com,False,,,CREDENTIALS,,,False,John Doe,,,,2025-07-11 18:38:25.027627+00:00,2025-07-12 19:10:31.661859,ACTIVE,,
