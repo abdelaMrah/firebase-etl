@@ -1,430 +1,678 @@
 import pandas as pd
-from sqlalchemy import create_engine, text, MetaData, Table, Column, String, Boolean, DateTime, JSON
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+import os
+from typing import Dict, Any, List, Optional
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
-from typing import List, Dict, Any, Optional
-import json
+import psycopg2
 from datetime import datetime
-from user_transformer import UserModel, UserStatus
+import uuid
+import numpy as np
 
 class PostgreSQLLoaderService:
     """
-    Service pour charger les données transformées dans PostgreSQL en utilisant SQLAlchemy
+    Service pour charger les données transformées dans PostgreSQL
     """
     
-    def __init__(self, 
-                 host: str = "localhost",
-                 port: int = 5434,
-                 database: str = "KAStudioDb",
-                 username: str = "user",
-                 password: str = "password",
-                 table_name: str = "User_clone"):
-        
-        self.host = host
-        self.port = port
-        self.database = database
-        self.username = username
-        self.password = password
-        self.table_name = table_name
-        
-        # Connection string for SQLAlchemy
-        self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{database}"
-        self.engine = None
-        self.metadata = None
-        
-        # Initialize load report
-        self.load_report = {
-            'total_processed': 0,
-            'successful_loads': 0,
-            'failed_loads': 0,
-            'success_rate': 0.0,
-            'errors': []
-        }
-    
-    def connect(self) -> bool:
+    def __init__(self):
         """
-        Établit la connexion à PostgreSQL existante
+        Initialize PostgreSQL connection
         """
         try:
-            self.engine = create_engine(
-                self.connection_string,
-                pool_pre_ping=True,  # Vérifier la connexion avant utilisation
-                pool_recycle=3600    # Recycler les connexions après 1h
-            )
+            # Get database connection parameters from environment
+            self.db_host = os.getenv('POSTGRES_HOST', 'localhost')
+            self.db_port = os.getenv('POSTGRES_PORT', '5432')
+            self.db_name = os.getenv('POSTGRES_DB', 'your_database')
+            self.db_user = os.getenv('POSTGRES_USER', 'user')
+            self.db_password = os.getenv('POSTGRES_PASSWORD', 'password')
+            
+            # Create connection string
+            self.connection_string = f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+            
+            # Create SQLAlchemy engine
+            self.engine = create_engine(self.connection_string)
             
             # Test connection
-            with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT current_database(), current_user"))
-                db_info = result.fetchone()
-                print(f"Successfully connected to PostgreSQL")
-                print(f"Database: {db_info[0]}, User: {db_info[1]}")
+            self._test_connection()
             
-            # Initialize metadata
-            self.metadata = MetaData()
-            return True
+            print("✅ PostgreSQL connection established successfully")
             
         except Exception as e:
-            print(f"Error connecting to PostgreSQL: {e}")
-            return False
-    
+            print(f"❌ Error connecting to PostgreSQL: {e}")
+            raise
+
+    def _test_connection(self):
+        """Test the database connection"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT 1"))
+                result.fetchone()
+            print("✅ Database connection test successful")
+        except Exception as e:
+            print(f"❌ Database connection test failed: {e}")
+            raise
+
+    def get_existing_user_ids(self) -> List[str]:
+        """
+        Récupère tous les IDs d'utilisateurs existants dans la base de données
+        """
+        try:
+            with self.engine.connect() as conn:
+                query = text('SELECT id FROM public."User"')
+                result = conn.execute(query)
+                existing_ids = [row[0] for row in result.fetchall()]
+                
+            print(f"📊 Found {len(existing_ids)} existing users in database")
+            return existing_ids
+            
+        except Exception as e:
+            print(f"❌ Error fetching existing user IDs: {e}")
+            return []
+
+    def get_existing_user_emails(self) -> List[str]:
+        """
+        Récupère tous les emails d'utilisateurs existants dans la base de données
+        """
+        try:
+            with self.engine.connect() as conn:
+                query = text('SELECT email FROM public."User"')
+                result = conn.execute(query)
+                existing_emails = [row[0] for row in result.fetchall()]
+                
+            print(f"📊 Found {len(existing_emails)} existing user emails in database")
+            return existing_emails
+            
+        except Exception as e:
+            print(f"❌ Error fetching existing user emails: {e}")
+            return []
+
     def check_table_exists(self) -> bool:
         """
-        Vérifie si la table existe dans la base de données
+        Vérifie si la table User existe
         """
         try:
-            with self.engine.connect() as conn:
-                # CORRECTION: Utiliser des guillemets dans la requête d'existence
-                result = conn.execute(text(f"""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = '{self.table_name}'
-                    );
-                """))
-                return result.scalar()
-        except Exception as e:
-            print(f"Error checking table existence: {e}")
-            return False
-    
-    def get_table_schema(self) -> Optional[Dict[str, Any]]:
-        """
-        Récupère le schéma de la table
-        """
-        try:
-            with self.engine.connect() as conn:
-                # Get column information
-                # CORRECTION: Utiliser le nom exact de la table
-                columns_result = conn.execute(text(f"""
-                    SELECT column_name, data_type, is_nullable
-                    FROM information_schema.columns 
-                    WHERE table_name = '{self.table_name}' 
-                    AND table_schema = 'public'
-                    ORDER BY ordinal_position;
-                """))
+            inspector = inspect(self.engine)
+            tables = inspector.get_table_names(schema='public')
+            exists = 'User' in tables
+            
+            if exists:
+                print("✅ Table 'User' exists")
+            else:
+                print("❌ Table 'User' does not exist")
                 
-                columns = []
-                for row in columns_result.fetchall():
-                    columns.append({
-                        'name': row[0],
-                        'type': row[1],
-                        'nullable': row[2] == 'YES'
-                    })
-                
-                if columns:
-                    return {
-                        'table_name': self.table_name,
-                        'columns': [col['name'] for col in columns],
-                        'column_details': columns
-                    }
-                else:
-                    return None
-                    
+            return exists
+            
         except Exception as e:
-            print(f"Error getting table schema: {e}")
-            return None
-    
-    def prepare_dataframe_for_existing_table(self, df: pd.DataFrame) -> pd.DataFrame:
+            print(f"❌ Error checking table existence: {e}")
+            return False
+
+    def get_table_info(self) -> Dict[str, Any]:
         """
-        Prépare le DataFrame pour l'insertion dans la table existante
-        """
-        # Get existing table schema
-        schema = self.get_table_schema()
-        if not schema:
-            print("Warning: Could not retrieve table schema")
-            return df
-        
-        existing_columns = schema['columns']
-        prepared_df = df.copy()
-        
-        # Column mapping pour s'adapter au schéma existant
-        column_mapping = {
-            'emailVerified': 'email_verified',
-            'profilePic': 'profile_pic', 
-            'phoneNumber': 'phone_number',
-            'phoneVerified': 'phone_verified',
-            'createdAt': 'created_at',
-            'updatedAt': 'updated_at',
-            'lastConnexion': 'last_connexion'
-        }
-        
-        # Apply column mapping
-        for old_col, new_col in column_mapping.items():
-            if old_col in prepared_df.columns and new_col in existing_columns:
-                prepared_df = prepared_df.rename(columns={old_col: new_col})
-        
-        # Keep only columns that exist in the target table
-        df_columns = prepared_df.columns.tolist()
-        columns_to_keep = [col for col in df_columns if col in existing_columns]
-        prepared_df = prepared_df[columns_to_keep]
-        
-        # Convert datetime columns
-        datetime_columns = ['birthdate', 'created_at', 'updated_at', 'last_connexion']
-        for col in datetime_columns:
-            if col in prepared_df.columns:
-                prepared_df[col] = pd.to_datetime(prepared_df[col], errors='coerce')
-        
-        # Handle interests - convert to JSON string if column exists
-        if 'interests' in prepared_df.columns and 'interests' in existing_columns:
-            prepared_df['interests'] = prepared_df['interests'].apply(
-                lambda x: json.dumps(x) if x is not None and isinstance(x, list) else None
-            )
-        
-        # Add ETL timestamp if column exists
-        if 'etl_loaded_at' in existing_columns:
-            prepared_df['etl_loaded_at'] = datetime.now()
-        
-        # Handle None/NaN values
-        prepared_df = prepared_df.where(pd.notna(prepared_df), None)
-        
-        print(f"DataFrame prepared with {len(prepared_df.columns)} columns matching table schema")
-        return prepared_df
-    
-    def _reset_load_report(self):
-        """
-        Remet à zéro le rapport de chargement
-        """
-        self.load_report = {
-            'total_processed': 0,
-            'successful_loads': 0,
-            'failed_loads': 0,
-            'success_rate': 0.0,
-            'errors': []
-        }
-    
-    def get_load_report(self) -> Dict[str, Any]:
-        """
-        Retourne le rapport de chargement actuel
-        """
-        return self.load_report.copy()
-    
-    def load_users_with_sqlalchemy(self, users_df: pd.DataFrame, method: str = 'append', chunk_size: int = 1000) -> bool:
-        """
-        Charge les utilisateurs en utilisant SQLAlchemy
-        
-        Args:
-            users_df: DataFrame with user data
-            method: 'replace', 'append'
-            chunk_size: Nombre d'enregistrements par chunk
+        Récupère les informations sur la table User
         """
         try:
-            self._reset_load_report()
+            inspector = inspect(self.engine)
             
-            # Prepare data
-            users_df_clean = self._prepare_dataframe_for_loading(users_df)
-            print(f"DataFrame prepared with {len(users_df_clean.columns)} columns matching table schema")
+            # Get columns
+            columns = inspector.get_columns('User', schema='public')
+            column_names = [col['name'] for col in columns]
             
-            total_records = len(users_df_clean)
-            print(f"Loading {total_records} records in chunks of {chunk_size}...")
+            # Get indexes
+            indexes = inspector.get_indexes('User', schema='public')
             
-            # Use to_sql with proper table name quoting
-            users_df_clean.to_sql(
-                name=self.table_name,
-                con=self.engine,
-                if_exists=method,
-                index=False,
-                chunksize=chunk_size,
-                method='multi'
-            )
+            # Get row count
+            with self.engine.connect() as conn:
+                count_query = text('SELECT COUNT(*) FROM public."User"')
+                result = conn.execute(count_query)
+                row_count = result.fetchone()[0]
             
-            # Update load report
-            self.load_report['total_processed'] = total_records
-            self.load_report['successful_loads'] = total_records
-            self.load_report['success_rate'] = 100.0
+            info = {
+                'columns': column_names,
+                'column_details': columns,
+                'indexes': indexes,
+                'row_count': row_count
+            }
             
-            return True
+            print(f"📋 Table info - Columns: {len(column_names)}, Rows: {row_count}")
+            return info
             
         except Exception as e:
-            error_msg = f"SQLAlchemy Error loading users: {str(e)}"
-            print(error_msg)
-            self.load_report['errors'].append({
-                'method': method,
-                'error': error_msg,
-                'record_count': len(users_df)
-            })
-            return False
-    
-    def _prepare_dataframe_for_loading(self, df: pd.DataFrame) -> pd.DataFrame:
+            print(f"❌ Error getting table info: {e}")
+            return {}
+
+    def _clean_dataframe_for_postgres(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Prépare le DataFrame pour le chargement en base
+        Nettoie le DataFrame pour PostgreSQL en gérant NaT et autres valeurs problématiques
         """
         df_clean = df.copy()
         
-        # Handle datetime columns - convert to proper datetime objects
+        # Convert datetime columns and handle NaT de manière plus agressive
         datetime_columns = ['createdAt', 'updatedAt', 'birthdate', 'lastConnexion']
         for col in datetime_columns:
             if col in df_clean.columns:
-                # Convert to datetime, handling various formats
-                df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce', utc=True)
+                print(f"🧹 Cleaning datetime column: {col}")
+                
+                # Méthode plus agressive pour nettoyer les NaT
+                def ultra_clean_datetime(val):
+                    try:
+                        # Vérifications multiples pour NaT
+                        if val is None:
+                            return None
+                        if pd.isna(val):
+                            return None
+                        if hasattr(val, '__str__'):
+                            val_str = str(val).lower().strip()
+                            if val_str in ['nat', 'none', 'null', '', 'nan']:
+                                return None
+                        
+                        # Si c'est un pandas NaT spécifique
+                        if hasattr(val, '_value') and pd.isna(val):
+                            return None
+                            
+                        # Si c'est déjà un datetime, le garder
+                        if isinstance(val, datetime):
+                            return val
+                            
+                        # Essayer de convertir
+                        if isinstance(val, str) and val.strip():
+                            try:
+                                converted = pd.to_datetime(val, errors='coerce')
+                                if pd.isna(converted):
+                                    return None
+                                return converted.to_pydatetime()
+                            except:
+                                return None
+                                
+                        # Pour tout le reste, essayer pandas to_datetime
+                        try:
+                            converted = pd.to_datetime(val, errors='coerce')
+                            if pd.isna(converted):
+                                return None
+                            return converted.to_pydatetime()
+                        except:
+                            return None
+                            
+                    except Exception as e:
+                        print(f"⚠️  Error cleaning datetime value {val}: {e}")
+                        return None
+                
+                # Appliquer le nettoyage ultra
+                df_clean[col] = df_clean[col].apply(ultra_clean_datetime)
+                
+                # Vérification finale : s'assurer qu'il n'y a plus de NaT
+                nat_count = 0
+                for idx, val in enumerate(df_clean[col]):
+                    try:
+                        if pd.isna(val) or str(val).lower() == 'nat':
+                            df_clean.at[idx, col] = None
+                            nat_count += 1
+                    except:
+                        df_clean.at[idx, col] = None
+                        nat_count += 1
+                
+                if nat_count > 0:
+                    print(f"🧹 Cleaned {nat_count} remaining NaT values in {col}")
         
-        # Handle enum values (convert to string)
-        for col in df_clean.columns:
-            if df_clean[col].dtype == 'object':
-                # Convert enum objects to their string values
-                df_clean[col] = df_clean[col].apply(
-                    lambda x: x.value if hasattr(x, 'value') else (str(x) if x is not None else None)
-                )
-                # Replace 'nan' strings with None
-                df_clean[col] = df_clean[col].replace(['nan', 'None'], None)
+        # Handle UserStatus enum values
+        if 'status' in df_clean.columns:
+            df_clean['status'] = df_clean['status'].apply(
+                lambda x: x.value if hasattr(x, 'value') else str(x) if x is not None else 'ACTIVE'
+            )
         
-        # Handle boolean columns explicitly
+        # Handle interests array
+        if 'interests' in df_clean.columns:
+            df_clean['interests'] = df_clean['interests'].apply(self._format_array_for_postgres)
+        
+        # Handle boolean columns
         bool_columns = ['emailVerified', 'phoneVerified']
         for col in bool_columns:
             if col in df_clean.columns:
-                df_clean[col] = df_clean[col].astype(bool)
+                df_clean[col] = df_clean[col].fillna(False).astype(bool)
         
-        # Handle list columns (like interests) - convert to JSON strings or None
-        list_columns = ['interests']
-        for col in list_columns:
+        # Handle string columns - replace NaN with None
+        string_columns = ['password', 'uid', 'profilePic', 'phoneNumber', 'name', 'city', 'photo']
+        for col in string_columns:
             if col in df_clean.columns:
-                df_clean[col] = df_clean[col].apply(
-                    lambda x: None if x is None or pd.isna(x) else (x if isinstance(x, list) else None)
-                )
+                df_clean[col] = df_clean[col].where(pd.notna(df_clean[col]), None)
         
-        # Replace pandas NaT and NaN with None for PostgreSQL compatibility
-        df_clean = df_clean.where(pd.notnull(df_clean), None)
+        # Ensure required columns have values
+        if 'provider' in df_clean.columns:
+            df_clean['provider'] = df_clean['provider'].fillna('CREDENTIALS')
         
+        print(f"🧹 Cleaned DataFrame: {len(df_clean)} rows ready for PostgreSQL")
         return df_clean
 
-    def upsert_users_with_sqlalchemy(self, users_df: pd.DataFrame, chunk_size: int = 1000) -> bool:
+    def _final_clean_value(self, value: Any) -> Any:
         """
-        Upsert des utilisateurs en utilisant SQLAlchemy avec ON CONFLICT
+        Nettoyage final ultra-agressif des valeurs avant insertion PostgreSQL
         """
+        if value is None:
+            return None
+            
+        # Vérifications multiples et ultra-agressives pour NaT
         try:
-            self._reset_load_report()
+            # Test 1: pandas isna
+            if pd.isna(value):
+                return None
+        except (ValueError, TypeError):
+            pass
             
-            # Prepare data
-            users_df_clean = self._prepare_dataframe_for_loading(users_df)
-            print(f"DataFrame prepared with {len(users_df_clean.columns)} columns matching table schema")
+        try:
+            # Test 2: string representation
+            val_str = str(value).lower().strip()
+            if val_str in ['nat', 'none', 'null', '', 'nan', 'NaT']:
+                return None
+        except:
+            pass
             
-            total_records = len(users_df_clean)
-            print(f"Upserting {total_records} records in chunks of {chunk_size}...")
+        try:
+            # Test 3: pandas NaT spécifique
+            if hasattr(value, '_value') and pd.isna(value):
+                return None
+        except:
+            pass
             
-            with self.engine.begin() as conn:  # Use begin() for automatic transaction management
-                for i in range(0, total_records, chunk_size):
-                    chunk = users_df_clean.iloc[i:i + chunk_size]
+        try:
+            # Test 4: si c'est un pandas Timestamp avec NaT
+            if hasattr(value, 'to_pydatetime'):
+                if pd.isna(value):
+                    return None
+                return value.to_pydatetime()
+        except:
+            return None
+            
+        try:
+            # Test 5: float NaN
+            if isinstance(value, float) and np.isnan(value):
+                return None
+        except:
+            pass
+            
+        # Si on arrive ici, la valeur devrait être saine
+        return value
+
+    def _insert_single_user(self, user_data: Dict[str, Any]) -> None:
+        """
+        Insère un seul utilisateur en excluant temporairement les colonnes problématiques
+        """
+        with self.engine.connect() as conn:
+            with conn.begin():  # Individual transaction
+                # Liste des colonnes à exclure temporairement si elles causent des problèmes
+                problematic_columns = ['birthdate']  # Ajouter d'autres si nécessaire
+                
+                columns = []
+                placeholders = []
+                clean_params = {}
+                
+                for key, value in user_data.items():
+                    # Skip les colonnes problématiques pour l'instant
+                    if key in problematic_columns:
+                        continue
+                        
+                    cleaned_value = self._final_clean_value(value)
                     
-                    try:
-                        # Build column list
-                        columns = list(chunk.columns)
-                        
-                        # Build UPDATE SET clause for ON CONFLICT (exclude id from updates)
-                        update_clauses = []
-                        for col in columns:
-                            if col != 'id':  # Don't update the primary key
-                                update_clauses.append(f'"{col}" = EXCLUDED."{col}"')
-                        
-                        update_set = ", ".join(update_clauses)
-                        
-                        # Build the upsert query with proper quoting
-                        quoted_columns = [f'"{col}"' for col in columns]
-                        # CORRECTION: Utiliser des placeholders simples, pas doubles
-                        placeholder_columns = [f':{col}' for col in columns]  # Changed from %() to :
-                        
-                        upsert_query = f"""
-                        INSERT INTO "{self.table_name}" ({', '.join(quoted_columns)})
-                        VALUES ({', '.join(placeholder_columns)})
-                        ON CONFLICT (id) 
-                        DO UPDATE SET {update_set}
-                        """
-                        
-                        print(f"Debug - Upsert query: {upsert_query[:200]}...")  # Debug output
-                        
-                        # Execute for each row in chunk
-                        for _, row in chunk.iterrows():
-                            row_dict = row.to_dict()
-                            
-                            # Final cleanup of values for PostgreSQL
-                            for key, value in row_dict.items():
-                                if pd.isna(value) or value == 'None' or value == 'nan':
-                                    row_dict[key] = None
-                                elif isinstance(value, pd.Timestamp):
-                                    # Convert pandas Timestamp to Python datetime
-                                    row_dict[key] = value.to_pydatetime()
-                            
-                            print(f"Debug - Executing with data: {list(row_dict.keys())}")  # Debug
-                            conn.execute(text(upsert_query), row_dict)
-                            
-                        self.load_report['successful_loads'] += len(chunk)
-                        print(f"✓ Processed chunk {i//chunk_size + 1}: {len(chunk)} records")
-                        
-                    except Exception as chunk_error:
-                        error_msg = f"Error in chunk {i//chunk_size + 1}: {str(chunk_error)}"
-                        print(f"❌ Chunk error: {error_msg}")
-                        self.load_report['errors'].append({
-                            'method': 'upsert',
-                            'error': str(chunk_error),
-                            'record_count': len(chunk),
-                            'chunk': i//chunk_size + 1
-                        })
-                        self.load_report['failed_loads'] += len(chunk)
-                        raise  # Re-raise to rollback transaction
-            
-            # Update report
-            self.load_report['total_processed'] = total_records
-            self.load_report['success_rate'] = (self.load_report['successful_loads'] / total_records) * 100 if total_records > 0 else 0
-            
-            print(f"✅ Upsert completed successfully: {self.load_report['successful_loads']}/{total_records} records")
-            return self.load_report['successful_loads'] > 0
-            
+                    if cleaned_value is not None:
+                        columns.append(f'"{key}"')
+                        placeholders.append(f':{key}')
+                        clean_params[key] = cleaned_value
+                
+                if not columns:
+                    raise ValueError("No valid data to insert")
+                
+                query = f"""
+                    INSERT INTO public."User" ({', '.join(columns)})
+                    VALUES ({', '.join(placeholders)})
+                """
+                
+                conn.execute(text(query), clean_params)
+
+    def _prepare_dataframe_for_insertion(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prépare le DataFrame pour l'insertion en PostgreSQL (deprecated - use _clean_dataframe_for_postgres)
+        """
+        return self._clean_dataframe_for_postgres(df)
+
+    def _format_array_for_postgres(self, value) -> Optional[str]:
+        """
+        Formate les arrays pour PostgreSQL
+        """
+        if value is None or (isinstance(value, list) and len(value) == 0):
+            return None
+        
+        if isinstance(value, list):
+            # Escape quotes and format as PostgreSQL array
+            escaped_items = [str(item).replace("'", "''") if item is not None else '' for item in value]
+            return "{" + ",".join(f"'{item}'" for item in escaped_items) + "}"
+        
+        if isinstance(value, str):
+            # Try to parse as array if it looks like one
+            value = value.strip()
+            if value.startswith('{') and value.endswith('}'):
+                return value  # Already formatted
+            else:
+                return "{'" + value.replace("'", "''") + "'}"
+        
+        return None
+
+    def load_single_user(self, user_data: Dict[str, Any]) -> bool:
+        """
+        Charge un seul utilisateur dans PostgreSQL
+        """
+        try:
+            self._insert_single_user(user_data)
+            print(f"✅ User {user_data.get('id', 'unknown')} inserted successfully")
+            return True
         except Exception as e:
-            error_msg = f"Error during upsert: {str(e)}"
-            print(error_msg)
-            self.load_report['errors'].append({
-                'method': 'upsert',
-                'error': str(e),
-                'record_count': len(users_df)
-            })
+            print(f"❌ Failed to insert user {user_data.get('id', 'unknown')}: {e}")
             return False
-    
-    def get_users_count(self) -> int:
+
+    def update_user(self, user_id: str, user_data: Dict[str, Any]) -> bool:
         """
-        Retourne le nombre d'utilisateurs dans la table
+        Met à jour un utilisateur existant
         """
         try:
             with self.engine.connect() as conn:
-                # IMPORTANT: Utiliser des guillemets pour préserver la casse
-                result = conn.execute(text(f'SELECT COUNT(*) FROM "{self.table_name}"'))
-                count = result.scalar()
-            return count
+                with conn.begin():
+                    # Build UPDATE query
+                    set_clauses = []
+                    clean_params = {'user_id': user_id}
+                    
+                    for key, value in user_data.items():
+                        if key != 'id':  # Don't update the ID
+                            set_clauses.append(f'"{key}" = :{key}')
+                            # Clean the value
+                            if pd.isna(value):
+                                clean_params[key] = None
+                            elif hasattr(value, 'to_pydatetime'):
+                                clean_params[key] = value.to_pydatetime()
+                            else:
+                                clean_params[key] = value
+                    
+                    query = f"""
+                        UPDATE public."User"
+                        SET {', '.join(set_clauses)}
+                        WHERE id = :user_id
+                    """
+                    
+                    conn.execute(text(query), clean_params)
+                
+                print(f"✅ User {user_id} updated successfully")
+                return True
+                
         except Exception as e:
-            print(f"Error getting users count: {e}")
-            return 0
-    
-    def validate_data_integrity(self) -> Dict[str, Any]:
+            print(f"❌ Failed to update user {user_id}: {e}")
+            return False
+
+    def delete_user(self, user_id: str) -> bool:
         """
-        Valide l'intégrité des données chargées
+        Supprime un utilisateur
         """
         try:
             with self.engine.connect() as conn:
-                # CORRECTION: Guillemets autour du nom de table
-                duplicate_check = conn.execute(text(f"""
-                    SELECT COUNT(*) as total_count, COUNT(DISTINCT id) as unique_count
-                    FROM "{self.table_name}"
-                """)).fetchone()
+                with conn.begin():
+                    query = text('DELETE FROM public."User" WHERE id = :user_id')
+                    result = conn.execute(query, {'user_id': user_id})
+                    
+                    if result.rowcount > 0:
+                        print(f"✅ User {user_id} deleted successfully")
+                        return True
+                    else:
+                        print(f"⚠️  User {user_id} not found")
+                        return False
+                        
+        except Exception as e:
+            print(f"❌ Failed to delete user {user_id}: {e}")
+            return False
+
+    def get_user_stats(self) -> Dict[str, Any]:
+        """
+        Récupère les statistiques des utilisateurs
+        """
+        try:
+            with self.engine.connect() as conn:
+                # Total users
+                total_query = text('SELECT COUNT(*) FROM public."User"')
+                total_users = conn.execute(total_query).fetchone()[0]
                 
-                # Check for invalid emails
-                try:
-                    invalid_emails = conn.execute(text(f"""
-                        SELECT COUNT(*) FROM "{self.table_name}"
-                        WHERE email IS NULL OR email = '' OR email NOT LIKE '%@%'
-                    """)).scalar()
-                except:
-                    invalid_emails = "N/A (email column not found)"
+                # Users by provider
+                provider_query = text('''
+                    SELECT provider, COUNT(*) 
+                    FROM public."User" 
+                    GROUP BY provider
+                ''')
+                provider_stats = dict(conn.execute(provider_query).fetchall())
                 
-                return {
-                    'total_records': duplicate_check[0],
-                    'unique_records': duplicate_check[1],
-                    'has_duplicates': duplicate_check[0] != duplicate_check[1],
-                    'invalid_emails': invalid_emails
+                # Users with email verification
+                verified_query = text('''
+                    SELECT "emailVerified", COUNT(*) 
+                    FROM public."User" 
+                    GROUP BY "emailVerified"
+                ''')
+                verified_stats = dict(conn.execute(verified_query).fetchall())
+                
+                # Recent users (last 30 days)
+                recent_query = text('''
+                    SELECT COUNT(*) 
+                    FROM public."User" 
+                    WHERE "createdAt" >= NOW() - INTERVAL '30 days'
+                ''')
+                recent_users = conn.execute(recent_query).fetchone()[0]
+                
+                stats = {
+                    'total_users': total_users,
+                    'provider_distribution': provider_stats,
+                    'email_verification': verified_stats,
+                    'recent_users_30_days': recent_users
                 }
+                
+                print(f"📊 Database stats - Total: {total_users}, Recent: {recent_users}")
+                return stats
+                
         except Exception as e:
-            print(f"Error validating data integrity: {e}")
+            print(f"❌ Error getting user stats: {e}")
             return {}
-    
-    def close_connection(self):
+
+    def cleanup_duplicates(self, column: str = 'email') -> Dict[str, Any]:
         """
-        Ferme la connexion SQLAlchemy
+        Nettoie les doublons dans la base de données
         """
-        if self.engine:
-            self.engine.dispose()
-            print("Database connection closed")
+        try:
+            with self.engine.connect() as conn:
+                with conn.begin():
+                    # Find duplicates
+                    duplicate_query = text(f'''
+                        SELECT "{column}", COUNT(*) 
+                        FROM public."User" 
+                        GROUP BY "{column}" 
+                        HAVING COUNT(*) > 1
+                    ''')
+                    
+                    duplicates = conn.execute(duplicate_query).fetchall()
+                    
+                    if not duplicates:
+                        print("✅ No duplicates found")
+                        return {'duplicates_found': 0, 'removed': 0}
+                    
+                    print(f"⚠️  Found {len(duplicates)} duplicate {column} values")
+                    
+                    removed_count = 0
+                    for duplicate_value, count in duplicates:
+                        # Keep the newest record, delete the rest
+                        delete_query = text(f'''
+                            DELETE FROM public."User" 
+                            WHERE "{column}" = :value 
+                            AND id NOT IN (
+                                SELECT id FROM public."User" 
+                                WHERE "{column}" = :value 
+                                ORDER BY "createdAt" DESC 
+                                LIMIT 1
+                            )
+                        ''')
+                        
+                        result = conn.execute(delete_query, {'value': duplicate_value})
+                        removed_count += result.rowcount
+                        print(f"🧹 Removed {result.rowcount} duplicate records for {column}: {duplicate_value}")
+                    
+                    return {
+                        'duplicates_found': len(duplicates),
+                        'removed': removed_count
+                    }
+                
+        except Exception as e:
+            print(f"❌ Error cleaning duplicates: {e}")
+            return {'error': str(e)}
+
+    def load_users_dataframe(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Charge un DataFrame d'utilisateurs dans PostgreSQL avec gestion d'erreurs
+        """
+        try:
+            print(f"🔄 Starting to load {len(df)} users to PostgreSQL...")
+            
+            # Check if table exists (using existing method)
+            if not self.check_table_exists():
+                # Try to create table if it doesn't exist
+                try:
+                    self.create_user_table()
+                except:
+                    return {
+                        'success': False,
+                        'error': 'Table User does not exist and could not be created',
+                        'total_processed': 0,
+                        'inserted_count': 0,
+                        'failed_count': 0,
+                        'errors': []
+                    }
+            
+            # Clean dataframe for PostgreSQL
+            df_clean = self._clean_dataframe_for_postgres(df)
+            
+            # Track statistics
+            total_processed = len(df_clean)
+            inserted_count = 0
+            failed_count = 0
+            errors = []
+            
+            print("📝 Inserting users individually to handle errors gracefully...")
+            
+            # Insert users one by one to handle errors gracefully
+            for idx, row in df_clean.iterrows():
+                try:
+                    user_data = row.to_dict()
+                    self._insert_single_user(user_data)
+                    inserted_count += 1
+                    
+                    # Progress indicator
+                    if (idx + 1) % 100 == 0 or (idx + 1) == len(df_clean):
+                        print(f"📝 Processed {idx + 1}/{len(df_clean)} users... (Success: {inserted_count}, Failed: {failed_count})")
+                        
+                except Exception as e:
+                    failed_count += 1
+                    error_info = {
+                        'user_id': user_data.get('id', 'unknown'),
+                        'error': str(e)
+                    }
+                    errors.append(error_info)
+                    print(f"❌ Failed to insert user {user_data.get('id', 'unknown')}: {e}")
+            
+            print("✅ Loading completed!")
+            
+            # Get updated database stats
+            try:
+                stats = self.get_user_stats()
+            except:
+                stats = {'total_users': 0, 'provider_distribution': {}}
+            
+            return {
+                'success': True,
+                'total_processed': total_processed,
+                'inserted_count': inserted_count,
+                'failed_count': failed_count,
+                'errors': errors,
+                'database_stats': stats
+            }
+            
+        except Exception as e:
+            print(f"❌ Critical error during DataFrame loading: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'success': False,
+                'error': str(e),
+                'total_processed': len(df) if df is not None else 0,
+                'inserted_count': 0,
+                'failed_count': 0,
+                'errors': []
+            }
+
+    def load_users_list(self, users_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Charge une liste d'utilisateurs dans PostgreSQL
+        """
+        # Convert list to DataFrame and use the DataFrame method
+        df = pd.DataFrame(users_list)
+        return self.load_users_dataframe(df)
+
+    def ensure_table_exists(self) -> bool:
+        """
+        Vérifie que la table User existe, sinon la crée
+        """
+        try:
+            with self.engine.connect() as conn:
+                # Check if table exists
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' 
+                        AND table_name = 'User'
+                    );
+                """))
+                
+                table_exists = result.scalar()
+                
+                if table_exists:
+                    print("✅ Table 'User' exists")
+                    return True
+                else:
+                    print("⚠️  Table 'User' does not exist, creating it...")
+                    return self.create_user_table()
+                    
+        except Exception as e:
+            print(f"❌ Error checking table existence: {e}")
+            return False
+
+    def create_user_table(self) -> bool:
+        """
+        Crée la table User si elle n'existe pas
+        """
+        try:
+            with self.engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS public."User" (
+                            "id" VARCHAR(255) PRIMARY KEY,
+                            "email" VARCHAR(255) UNIQUE NOT NULL,
+                            "emailVerified" BOOLEAN DEFAULT FALSE,
+                            "password" TEXT,
+                            "uid" VARCHAR(255),
+                            "provider" VARCHAR(100) DEFAULT 'CREDENTIALS',
+                            "profilePic" TEXT,
+                            "phoneNumber" VARCHAR(50),
+                            "phoneVerified" BOOLEAN DEFAULT FALSE,
+                            "name" VARCHAR(255),
+                            "city" VARCHAR(255),
+                            "birthdate" TIMESTAMP,
+                            "photo" TEXT,
+                            "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            "updatedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            "status" VARCHAR(50) DEFAULT 'ACTIVE',
+                            "interests" TEXT,
+                            "lastConnexion" TIMESTAMP
+                        );
+                    """))
+                    
+            print("✅ Table 'User' created successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error creating table: {e}")
+            return False

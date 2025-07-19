@@ -19,226 +19,189 @@ def main():
     # Load environment variables from .env file
     load_dotenv()
     
-    # Initialize services
-    firebase_service = FirebaseUserService()
-    transformer_service = UserTransformerService()
-    
-    # Configuration pour votre base existante - utilise les bonnes variables d'environnement
-    postgres_config = {
-        'host': os.getenv('DB_HOST', 'localhost'),
-        'port': int(os.getenv('DB_PORT', 5434)),  # Note: port 5434 selon votre .env
-        'database': os.getenv('DB_NAME', 'KAStudioDb'),
-        'username': os.getenv('DB_USER', 'user'),
-        'password': os.getenv('DB_PASSWORD', 'password'),
-        'table_name': 'User_clone'  # Nom exact de votre table
-    }
-    
-    # Debug: Print config (remove password for security)
-    debug_config = postgres_config.copy()
-    debug_config['password'] = '*' * len(debug_config['password']) if debug_config['password'] else 'None'
-    print(f"Database config: {debug_config}")
-    
-    postgres_loader = PostgreSQLLoaderService(**postgres_config)
-    
-    print("=== Extracting raw users from Firebase ===")
-    raw_users_df = firebase_service.get_all_users_raw()
-    print(f"Raw users extracted: {len(raw_users_df)}")
-    
-    if not raw_users_df.empty:
-        # Debug: Print available columns
-        print(f"\n=== Available columns in Firebase data ===")
-        print(f"Columns: {raw_users_df.columns.tolist()}")
+    try:
+        # Initialize services
+        print("=== Initializing Services ===")
+        firebase_service = FirebaseUserService()
+        transformer_service = UserTransformerService()
+        postgres_service = PostgreSQLLoaderService()
         
-        print("\n=== Validating data before transformation ===")
-        validation_report = transformer_service.validate_required_fields(raw_users_df)
-        print(f"Validation report: {validation_report}")
+        # Debug database structure (optional)
+        firebase_service.debug_database_structure()
         
-        if validation_report['is_valid']:
-            print("\n=== Transforming users (with deduplication) ===")
-            # La déduplication est maintenant gérée dans le transformer
+        print("\n=== Extracting raw users from Firebase ===")
+        
+        # Get all users as raw data
+        raw_users_df = firebase_service.get_all_users_raw()
+        
+        print(f"Raw users extracted: {len(raw_users_df)}")
+        
+        if not raw_users_df.empty:
+            print(f"\n=== Raw Data Info ===")
+            print(f"Columns: {raw_users_df.columns.tolist()}")
+            print(f"Data types: {raw_users_df.dtypes.to_dict()}")
+            
+            # Export raw data for backup
+            raw_backup_file = firebase_service.export_raw_data()
+            print(f"Raw data backed up to: {raw_backup_file}")
+            
+            # Show sample (first few rows)
+            print(f"\n=== Sample Raw Data ===")
+            print(raw_users_df.head())
+            
+            # ====== TRANSFORMATION PHASE ======
+            print(f"\n=== Starting Data Transformation ===")
+            
+            # Step 1: Validate required fields
+            validation_result = transformer_service.validate_required_fields(raw_users_df)
+            print(f"📋 Field validation result: {validation_result}")
+            
+            if not validation_result['is_valid']:
+                print("❌ Data validation failed!")
+                if validation_result['missing_required_fields']:
+                    print(f"Missing required fields: {validation_result['missing_required_fields']}")
+                if validation_result['null_values_in_required_fields']:
+                    print(f"Null values in required fields: {validation_result['null_values_in_required_fields']}")
+                
+                # Try to fix missing required fields
+                if 'id' in validation_result['missing_required_fields']:
+                    print("🔧 Generating missing IDs...")
+                    raw_users_df['id'] = raw_users_df.apply(lambda row: row.get('uid') or str(uuid.uuid4())[:20], axis=1)
+                
+                if 'email' in validation_result['missing_required_fields']:
+                    print("❌ Cannot proceed without email field")
+                    return
+            
+            # Step 2: Transform users with deduplication
+            print(f"\n🔄 Transforming {len(raw_users_df)} users...")
             transformed_users_df = transformer_service.transform_users_dataframe(
                 raw_users_df, 
-                remove_duplicates=True  # Active la déduplication
+                remove_duplicates=True
             )
             
+            print(f"✅ Transformation completed!")
             print(f"Transformed users: {len(transformed_users_df)}")
-            print("\n=== Transformation Report ===")
-            report = transformer_service.get_transformation_report()
-            print(f"Success rate: {report['success_rate']:.2f}%")
-            print(f"Successful: {report['successful_transformations']}")
-            print(f"Failed: {report['failed_transformations']}")
             
-            # Afficher les stats de déduplication
-            if 'deduplication_stats' in report and report['deduplication_stats']:
-                dedup_stats = report['deduplication_stats']
-                print(f"\n=== Deduplication Stats ===")
-                print(f"Duplicates found: {dedup_stats.get('duplicates_found', 0)}")
-                print(f"Records removed: {dedup_stats.get('removed_count', 0)}")
-                if dedup_stats.get('deduplication_method'):
-                    print(f"Method used: {dedup_stats['deduplication_method']}")
+            # Step 3: Get transformation report
+            transformation_report = transformer_service.get_transformation_report()
+            print(f"\n=== Transformation Report ===")
+            print(f"✅ Successful transformations: {transformation_report['successful_transformations']}")
+            print(f"❌ Failed transformations: {transformation_report['failed_transformations']}")
+            print(f"📊 Success rate: {transformation_report['success_rate']:.2f}%")
             
-            if report['errors']:
-                print("\nTransformation errors:")
-                for error in report['errors'][:5]:  # Show first 5 errors
-                    print(f"- User {error['user_id']}: {error['error']}")
+            if transformation_report['deduplication_stats']:
+                dedup_stats = transformation_report['deduplication_stats']
+                print(f"🧹 Duplicates removed: {dedup_stats.get('removed_count', 0)}")
+                if dedup_stats.get('duplicates_found', 0) > 0:
+                    print(f"🔍 Duplicate details: {dedup_stats.get('unique_duplicate_values', 0)} unique duplicate values")
             
+            # Show transformation errors if any
+            if transformation_report['errors']:
+                print(f"\n⚠️  Transformation Errors ({len(transformation_report['errors'])}):")
+                for i, error in enumerate(transformation_report['errors'][:5]):  # Show first 5 errors
+                    print(f"  {i+1}. User ID: {error['user_id']} - Error: {error['error']}")
+                if len(transformation_report['errors']) > 5:
+                    print(f"  ... and {len(transformation_report['errors']) - 5} more errors")
+            
+            # Step 4: Show transformed data info
             if not transformed_users_df.empty:
-                print("\n=== Sample transformed data ===")
+                print(f"\n=== Transformed Data Info ===")
+                print(f"Columns: {transformed_users_df.columns.tolist()}")
+                print(f"Data types: {transformed_users_df.dtypes.to_dict()}")
+                
+                # Show sample transformed data
+                print(f"\n=== Sample Transformed Data ===")
                 print(transformed_users_df.head())
                 
-                # Export transformed data
-                transformer_service.export_transformed_users(
+                # Step 5: Export transformed data
+                print(f"\n📦 Exporting transformed data...")
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                transformed_filename = f"transformed_users_{timestamp}.csv"
+                
+                export_success = transformer_service.export_transformed_users(
                     transformed_users_df, 
-                    'transformed_users_output.csv'
+                    transformed_filename
                 )
                 
-                # NEW: Load data into existing PostgreSQL database
-                print("\n=== Loading data into PostgreSQL ===")
-                if postgres_loader.connect():
-                    # Check if table exists
-                    if postgres_loader.check_table_exists():
-                        print(f"✓ Table '{postgres_config['table_name']}' found in database")
-                        
-                        # Get table schema info
-                        schema = postgres_loader.get_table_schema()
-                        if schema:
-                            print(f"✓ Table has {len(schema['columns'])} columns")
-                        
-                        # Check existing data to avoid conflicts (CHECK BOTH EMAIL AND ID)
-                        print("\n=== Checking for existing data conflicts ===")
-                        try:
-                            with postgres_loader.engine.connect() as conn:
-                                # Get existing emails AND IDs
-                                existing_data_result = conn.execute(text(f"""
-                                    SELECT id, email FROM "{postgres_config['table_name']}"
-                                """))
-                                existing_data = existing_data_result.fetchall()
-                                
-                                if existing_data:
-                                    existing_emails = [row[1] for row in existing_data]
-                                    existing_ids = [row[0] for row in existing_data]
-                                    
-                                    print(f"✓ Found {len(existing_data)} existing records in database")
-                                    print(f"Existing emails: {existing_emails[:5]}...")  # Show first 5
-                                    print(f"Existing IDs: {existing_ids[:5]}...")  # Show first 5
-                                    
-                                    # NOUVELLE LOGIQUE: Gérer les conflits intelligemment
-                                    print("\n=== Resolving conflicts intelligently ===")
-                                    
-                                    new_users_list = []
-                                    id_changes = []
-                                    
-                                    for _, row in transformed_users_df.iterrows():
-                                        user_id = row['id']
-                                        user_email = row['email']
-                                        
-                                        # Cas 1: Email ET ID existent déjà -> Skip
-                                        if user_email in existing_emails and user_id in existing_ids:
-                                            print(f"  - SKIP: ID {user_id} and email {user_email} both exist")
-                                            continue
-                                        
-                                        # Cas 2: Email existe mais pas l'ID -> Skip (éviter doublons email)
-                                        elif user_email in existing_emails and user_id not in existing_ids:
-                                            print(f"  - SKIP: Email {user_email} already exists")
-                                            continue
-                                        
-                                        # Cas 3: ID existe mais pas l'email -> Générer nouveau ID
-                                        elif user_id in existing_ids and user_email not in existing_emails:
-                                            old_id = user_id
-                                            new_id = generate_new_unique_id(existing_ids + [u['id'] for u in new_users_list])
-                                            row_copy = row.copy()
-                                            row_copy['id'] = new_id
-                                            new_users_list.append(row_copy.to_dict())
-                                            id_changes.append({'old_id': old_id, 'new_id': new_id, 'email': user_email})
-                                            existing_ids.append(new_id)  # Éviter les conflits avec les nouveaux IDs
-                                            print(f"  - ID_CHANGE: {old_id} -> {new_id} for email {user_email}")
-                                        
-                                        # Cas 4: Ni email ni ID n'existent -> OK
-                                        else:
-                                            new_users_list.append(row.to_dict())
-                                            print(f"  - OK: New user {user_id} with email {user_email}")
-                                    
-                                    if id_changes:
-                                        print(f"\n=== ID Changes Summary ===")
-                                        for change in id_changes:
-                                            print(f"  - {change['old_id']} -> {change['new_id']} ({change['email']})")
-                                    
-                                    if new_users_list:
-                                        import pandas as pd
-                                        transformed_users_df = pd.DataFrame(new_users_list)
-                                        print(f"✓ {len(transformed_users_df)} records ready for insertion")
-                                    else:
-                                        print("ℹ️  No new records to insert after conflict resolution")
-                                        postgres_loader.close_connection()
-                                        return
-                                else:
-                                    print("✓ No existing records found, proceeding with all data")
-                                    
-                        except Exception as e:
-                            print(f"Warning: Could not check existing data: {e}")
-                            print(f"Proceeding with simple append method...")
-                        
-                        # Get current count
-                        initial_count = postgres_loader.get_users_count()
-                        print(f"✓ Current records in table: {initial_count}")
-                        
-                        # Load data using SQLAlchemy - maintenant avec append simple car les conflits sont résolus
-                        print("📦 Loading data using SQLAlchemy...")
-                        
-                        # Utiliser load_users_with_sqlalchemy au lieu de simple_load_users
-                        success = postgres_loader.load_users_with_sqlalchemy(
-                            transformed_users_df, 
-                            method='append', 
-                            chunk_size=500
-                        )
-                        
-                        if success:
-                            load_report = postgres_loader.get_load_report()
-                            final_count = postgres_loader.get_users_count()
-                            
-                            print(f"✓ Data loading completed")
-                            print(f"  - Records processed: {load_report['total_processed']}")
-                            print(f"  - Success rate: {load_report['success_rate']:.2f}%")
-                            print(f"  - Final count in database: {final_count}")
-                            print(f"  - New records added: {final_count - initial_count}")
-                            
-                            # Validate data integrity
-                            print("\n=== Validating data integrity ===")
-                            integrity_report = postgres_loader.validate_data_integrity()
-                            print(f"✓ Integrity check completed: {integrity_report}")
-                        else:
-                            print("❌ Failed to load data")
-                            load_report = postgres_loader.get_load_report()
-                            if load_report['errors']:
-                                print("Load errors:")
-                                for error in load_report['errors']:
-                                    print(f"  - {error}")
-                            
-                    else:
-                        print(f"❌ Table '{postgres_config['table_name']}' not found in database")
-                        print("Available tables:")
-                        try:
-                            with postgres_loader.engine.connect() as conn:
-                                result = conn.execute(text("""
-                                    SELECT table_name FROM information_schema.tables 
-                                    WHERE table_schema = 'public'
-                                    ORDER BY table_name;
-                                """))
-                                tables = [row[0] for row in result.fetchall()]
-                                for table in tables:
-                                    print(f"  - {table}")
-                        except Exception as e:
-                            print(f"  Error listing tables: {e}")
+                if export_success:
+                    print(f"✅ Transformed data exported successfully")
+                
+                # ====== LOADING PHASE ======
+                print(f"\n=== Starting Data Loading to PostgreSQL ===")
+                
+                # Step 6: Load to PostgreSQL
+                try:
+                    # Initialize PostgreSQL service here if not already done
+                    if 'postgres_service' not in locals():
+                        postgres_service = PostgreSQLLoaderService()
                     
-                    postgres_loader.close_connection()
-                else:
-                    print("❌ Failed to connect to PostgreSQL")
+                    # Check table info
+                    table_info = postgres_service.get_table_info()
+                    print(f"📋 Target table has {table_info.get('row_count', 0)} existing records")
+                    
+                    # Check if we need to generate new IDs for conflicts
+                    existing_ids = postgres_service.get_existing_user_ids()
+                    print(f"Found {len(existing_ids)} existing users in PostgreSQL")
+                    
+                    # Generate new IDs for any conflicts
+                    conflict_count = 0
+                    for idx, row in transformed_users_df.iterrows():
+                        if row['id'] in existing_ids:
+                            new_id = generate_new_unique_id(existing_ids)
+                            transformed_users_df.at[idx, 'id'] = new_id
+                            existing_ids.append(new_id)
+                            conflict_count += 1
+                    
+                    if conflict_count > 0:
+                        print(f"🔧 Resolved {conflict_count} ID conflicts by generating new IDs")
+                    
+                    # Load users to PostgreSQL
+                    load_result = postgres_service.load_users_dataframe(transformed_users_df)
+                    
+                    if load_result['success']:
+                        print(f"✅ Successfully loaded {load_result['inserted_count']} users to PostgreSQL")
+                        if load_result['failed_count'] > 0:
+                            print(f"⚠️  {load_result['failed_count']} users failed to load")
+                            
+                            # Show some failed user errors
+                            if load_result['errors']:
+                                print(f"\n⚠️  Loading Errors (first 3):")
+                                for i, error in enumerate(load_result['errors'][:3]):
+                                    print(f"  {i+1}. User ID: {error['user_id']} - Error: {error['error']}")
+                            
+                        # Show load statistics
+                        print(f"\n=== Loading Summary ===")
+                        print(f"📊 Total processed: {load_result['total_processed']}")
+                        print(f"✅ Successfully inserted: {load_result['inserted_count']}")
+                        print(f"❌ Failed insertions: {load_result['failed_count']}")
+                        print(f"📈 Success rate: {(load_result['inserted_count'] / load_result['total_processed']) * 100:.2f}%")
+                        
+                        # Get final database stats
+                        final_stats = postgres_service.get_user_stats()
+                        print(f"\n=== Final Database Stats ===")
+                        print(f"📊 Total users in database: {final_stats.get('total_users', 0)}")
+                        if final_stats.get('provider_distribution'):
+                            print(f"📊 Provider distribution: {final_stats['provider_distribution']}")
+                        
+                    else:
+                        print(f"❌ Loading failed: {load_result['error']}")
+                        
+                except Exception as e:
+                    print(f"❌ Error during loading phase: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            else:
+                print("❌ No users were successfully transformed")
+                
         else:
-            print("Data validation failed. Please check the required fields.")
-            print("Missing fields:", validation_report.get('missing_required_fields', []))
-            print("Null values:", validation_report.get('null_values_in_required_fields', {}))
-    else:
-        print("No users found in Firebase.")
+            print("❌ No users found. Check your Firebase configuration.")
+            
+    except Exception as e:
+        print(f"❌ Error in main execution: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
