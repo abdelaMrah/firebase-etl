@@ -423,6 +423,7 @@ class UserTransformerService:
         transformed_users = []
         
         for idx, row in df_cleaned.iterrows():
+            print(f"🔄Row :{row}...")
             raw_user = row.to_dict()
             user_model = self.transform_single_user(raw_user)
             

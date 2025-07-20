@@ -176,37 +176,24 @@ class FirebaseUserService:
             
             for uid, user_info in users_data.items():
                 if isinstance(user_info, dict):
-                    # Create a copy of user data
-                    user_record = user_info.copy()
+                    # Récupérer provider et date de création depuis Firebase Auth
+                    auth_info = self._determine_provider_and_creation_date(uid, user_info)
                     
-                    # Add the UID as 'id' field
-                    user_record['id'] = uid
-                    user_record['uid'] = uid  # Keep original UID as well
-                    
-                    # Determine provider and email using the new logic
-                    provider_info = self._determine_provider_and_email(uid, user_info)
-                    
-                    # Update user record with provider information
-                    if provider_info['email']:
-                        user_record['email'] = provider_info['email']
-                    user_record['provider'] = provider_info['provider']
-                    user_record['emailVerified'] = provider_info['email_verified']
-                    
-                    # Add additional metadata
-                    user_record['hasEmail'] = provider_info['email'] is not None
-                    user_record['authSource'] = 'database' if user_info.get('email') else 'auth' if provider_info['email'] else 'none'
+                    user_record = {
+                        'uid': uid,
+                        'provider': auth_info['provider'],
+                        'createdAt': auth_info['createdAt'],
+                        'email': auth_info['email'],
+                        'email_verified': auth_info['email_verified'],
+                        'hasEmail': auth_info['email'] is not None,
+                        **user_info  # Ajouter toutes les autres données du user_info
+                    }
                     
                     users_list.append(user_record)
                     processed_count += 1
-                    
-                    # Progress indicator for dev mode
-                    if self.mode == 'dev' and processed_count % 100 == 0:
-                        print(f"📝 Processed {processed_count}/{len(users_data)} users...")
-                    
                 else:
-                    # Handle case where user_info is not a dict
                     if self.mode == 'dev':
-                        print(f"⚠️  Skipping user {uid}: data is not a dictionary")
+                        print(f"⚠️  Invalid user data for {uid}: {type(user_info)}")
                     continue
             
             if not users_list:
@@ -418,3 +405,62 @@ class FirebaseUserService:
                 
         except Exception as e:
             print(f"❌ Error exploring database: {e}")
+
+    def _determine_provider_and_creation_date(self, uid: str, user_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Récupère le provider et la date de création pour un utilisateur depuis Firebase Auth
+        
+        Logique:
+        - Récupérer les infos depuis Firebase Auth pour chaque user
+        - Si provider = 'password' -> 'CREDENTIALS'
+        - Si provider = 'google.com' -> 'google.com'
+        - Récupérer createdAt (format ISO string UTC)
+        """
+        result = {
+            'provider': 'google.com',  # Default
+            'createdAt': None,
+            'email': None,
+            'email_verified': False
+        }
+        
+        try:
+            # Récupérer les infos depuis Firebase Auth
+            user_auth_record = auth.get_user(uid)
+            
+            # Récupérer la date de création (format ISO string UTC)
+            if hasattr(user_auth_record, 'user_metadata') and user_auth_record.user_metadata.creation_timestamp:
+                # Convertir timestamp en ISO string UTC
+                import datetime
+                creation_timestamp = user_auth_record.user_metadata.creation_timestamp / 1000  # Convertir ms en secondes
+                created_date = datetime.datetime.fromtimestamp(creation_timestamp, tz=datetime.timezone.utc)
+                result['createdAt'] = created_date.isoformat()
+            
+            # Récupérer l'email et sa vérification
+            if user_auth_record.email:
+                result['email'] = user_auth_record.email
+                result['email_verified'] = user_auth_record.email_verified
+            
+            # Déterminer le provider
+            if hasattr(user_auth_record, 'provider_data') and user_auth_record.provider_data:
+                # Prendre le premier provider
+                auth_provider = user_auth_record.provider_data[0].provider_id
+                if auth_provider == 'password':
+                    result['provider'] = 'CREDENTIALS'
+                elif auth_provider == 'google.com':
+                    result['provider'] = 'google.com'
+                else:
+                    # Autres providers (facebook, twitter, etc.)
+                    result['provider'] = auth_provider
+            else:
+                # Fallback: pas de provider_data
+                result['provider'] = 'google.com'
+            
+            if self.mode == 'dev':
+                print(f"🔍 Auth info for {uid}: provider={result['provider']}, created={result['createdAt']}, email={result['email']}")
+                
+        except Exception as auth_error:
+            if self.mode == 'dev':
+                print(f"⚠️  Could not retrieve auth info for {uid}: {auth_error}")
+            # Garder les valeurs par défaut
+        
+        return result
