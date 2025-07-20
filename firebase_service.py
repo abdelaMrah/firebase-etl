@@ -56,8 +56,10 @@ class FirebaseUserService:
         Détermine le provider et l'email pour un utilisateur
         
         Logique:
-        - Si email présent dans user_info ou Auth -> provider = 'CREDENTIALS'
         - Si pas d'email -> provider = 'google.com'
+        - Si email présent -> récupérer user.provider:
+          - Si provider = 'password' -> 'CREDENTIALS'
+          - Si provider = 'google.com' -> 'google.com'
         """
         result = {
             'email': None,
@@ -70,10 +72,37 @@ class FirebaseUserService:
         
         if email_from_db:
             result['email'] = email_from_db
-            result['provider'] = 'CREDENTIALS'
             result['email_verified'] = user_info.get('emailVerified', False)
+            
+            # Récupérer le provider depuis user_info
+            user_provider = user_info.get('provider')
+            
+            if user_provider == 'password':
+                result['provider'] = 'CREDENTIALS'
+            elif user_provider == 'google.com':
+                result['provider'] = 'google.com'
+            else:
+                # Fallback: essayer de récupérer depuis Firebase Auth
+                try:
+                    user_auth_record = auth.get_user(uid)
+                    if hasattr(user_auth_record, 'provider_data') and user_auth_record.provider_data:
+                        # Prendre le premier provider
+                        auth_provider = user_auth_record.provider_data[0].provider_id
+                        if auth_provider == 'password':
+                            result['provider'] = 'CREDENTIALS'
+                        elif auth_provider == 'google.com':
+                            result['provider'] = 'google.com'
+                        else:
+                            result['provider'] = 'CREDENTIALS'  # Défaut pour email existant
+                    else:
+                        result['provider'] = 'CREDENTIALS'  # Défaut pour email existant
+                except Exception as auth_error:
+                    if self.mode == 'dev':
+                        print(f"⚠️  Could not retrieve auth info for {uid}: {auth_error}")
+                    result['provider'] = 'CREDENTIALS'  # Défaut pour email existant
+            
             if self.mode == 'dev':
-                print(f"📧 Email found in database for {uid}: {email_from_db}")
+                print(f"📧 Email found for {uid}: {email_from_db}, provider: {result['provider']}")
         else:
             # Try to get email from Firebase Auth
             try:
@@ -81,25 +110,28 @@ class FirebaseUserService:
                 
                 if user_auth_record.email:
                     result['email'] = user_auth_record.email
-                    result['provider'] = 'CREDENTIALS'
                     result['email_verified'] = user_auth_record.email_verified
-                    if self.mode == 'dev':
-                        print(f"📧 Email retrieved from Auth for {uid}: {user_auth_record.email}")
                     
-                    # Check if user has Google provider
-                    if hasattr(user_auth_record, 'provider_data'):
-                        google_providers = [p for p in user_auth_record.provider_data if p.provider_id == 'google.com']
-                        if google_providers:
+                    # Déterminer le provider depuis Firebase Auth
+                    if hasattr(user_auth_record, 'provider_data') and user_auth_record.provider_data:
+                        auth_provider = user_auth_record.provider_data[0].provider_id
+                        if auth_provider == 'password':
+                            result['provider'] = 'CREDENTIALS'
+                        elif auth_provider == 'google.com':
                             result['provider'] = 'google.com'
-                            if self.mode == 'dev':
-                                print(f"🔍 Google provider detected for {uid}")
-                            
+                        else:
+                            result['provider'] = 'CREDENTIALS'
+                    else:
+                        result['provider'] = 'CREDENTIALS'
+                    
+                    if self.mode == 'dev':
+                        print(f"📧 Email retrieved from Auth for {uid}: {user_auth_record.email}, provider: {result['provider']}")
                 else:
                     # No email found, assume Google provider
                     result['provider'] = 'google.com'
                     if self.mode == 'dev':
                         print(f"❌ No email found for {uid}, setting provider to google.com")
-                    
+                
             except Exception as auth_error:
                 if self.mode == 'dev':
                     print(f"⚠️  Could not retrieve auth info for {uid}: {auth_error}")
