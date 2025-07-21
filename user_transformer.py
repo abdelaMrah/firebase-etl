@@ -1,9 +1,10 @@
 import pandas as pd
+import numpy as np
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, ValidationError
 from enum import Enum
-import numpy as np
+import json
 import uuid
 
 class UserStatus(str, Enum):
@@ -41,24 +42,24 @@ class UserTransformerService:
         self.successful_transformations = 0
         self.failed_transformations = 0
         self.deduplication_stats = {}
+        self.join_stats = {}
+
+    def _reset_counters(self):
+        """Reset les compteurs de transformation"""
+        self.transformation_errors = []
+        self.successful_transformations = 0
+        self.failed_transformations = 0
+        self.deduplication_stats = {}
+        self.join_stats = {}
     
     def _safe_isna(self, value: Any) -> bool:
         """
         Vérifie si une valeur est NaN/None de manière sécurisée
         """
         try:
-            if value is None:
-                return True
-            if isinstance(value, (list, np.ndarray)):
-                # Pour les arrays, vérifier si tous les éléments sont NaN
-                try:
-                    return bool(pd.isna(value).all())
-                except:
-                    return False
-            return bool(pd.isna(value))
+            return pd.isna(value) or value is None
         except (ValueError, TypeError):
-            # Si pd.isna() échoue, considérer comme non-NaN
-            return False
+            return value is None
     
     def _clean_nan_values(self, value: Any) -> Any:
         """
@@ -66,369 +67,498 @@ class UserTransformerService:
         """
         if self._safe_isna(value):
             return None
+        
         if isinstance(value, float) and np.isnan(value):
             return None
+        
         # Gestion spéciale des arrays pandas
         if isinstance(value, (list, np.ndarray)):
-            try:
-                # Si c'est un array avec tous des NaN
-                if pd.isna(value).all():
-                    return None
-                # Si c'est un array mixte, nettoyer les éléments
-                return [self._clean_nan_values(item) for item in value if not self._safe_isna(item)]
-            except:
-                return None
+            return [self._clean_nan_values(item) for item in value if not self._safe_isna(item)]
+        
         return value
     
     def _parse_datetime(self, value: Any) -> Optional[datetime]:
         """
-        Parse différents formats de datetime avec gestion robuste des NaT
+        Parse différents formats de datetime pour PostgreSQL
         """
-        value = self._clean_nan_values(value)
-        if value is None:
+        if not value or self._safe_isna(value):
             return None
         
-        # Vérification spéciale pour NaT de pandas
-        if pd.isna(value):
-            return None
+        try:
+            # Si c'est déjà un datetime
+            if isinstance(value, datetime):
+                return value
             
-        # Si c'est déjà un NaT, retourner None
-        if hasattr(value, '_value') and pd.isna(value):
-            return None
+            # Si c'est un timestamp Unix
+            if isinstance(value, (int, float)):
+                # Gérer les timestamps en millisecondes ou secondes
+                if value > 1e10:  # Timestamp en millisecondes
+                    return datetime.fromtimestamp(value / 1000)
+                else:  # Timestamp en secondes
+                    return datetime.fromtimestamp(value)
             
-        if isinstance(value, datetime):
-            return value
-        
-        if isinstance(value, str):
-            value_str = str(value).strip().lower()
-            if value_str in ['nat', 'none', 'null', '', 'nan']:
-                return None
+            # Si c'est une string
+            if isinstance(value, str):
+                # Format ISO
+                if 'T' in value or '+' in value or 'Z' in value:
+                    return datetime.fromisoformat(value.replace('Z', '+00:00'))
                 
-            try:
-                # Try different datetime formats
+                # Essayer différents formats
                 formats = [
                     '%Y-%m-%d %H:%M:%S',
-                    '%Y-%m-%dT%H:%M:%S',
-                    '%Y-%m-%dT%H:%M:%S.%f',
-                    '%Y-%m-%dT%H:%M:%SZ',
-                    '%Y-%m-%d'
+                    '%Y-%m-%d',
+                    '%d/%m/%Y',
+                    '%m/%d/%Y',
+                    '%Y-%m-%dT%H:%M:%S.%f'
                 ]
+                
                 for fmt in formats:
                     try:
                         return datetime.strptime(value, fmt)
                     except ValueError:
                         continue
-                
-                # If no format matches, try pandas to_datetime
-                parsed = pd.to_datetime(value, errors='coerce')
-                if pd.isna(parsed):
-                    return None
-                return parsed.to_pydatetime()
-            except:
-                return None
-        
-        # Handle Firebase Timestamp objects
-        if hasattr(value, 'seconds'):
-            try:
-                return datetime.fromtimestamp(value.seconds)
-            except:
-                return None
-        
-        # Handle Unix timestamps
-        if isinstance(value, (int, float)) and not np.isnan(value) and value > 0:
-            try:
-                # Check if it's in milliseconds or seconds
-                if value > 1e10:  # milliseconds
-                    return datetime.fromtimestamp(value / 1000)
-                else:  # seconds
-                    return datetime.fromtimestamp(value)
-            except:
-                return None
-        
-        return None
+            
+            return None
+            
+        except Exception:
+            return None
     
     def _parse_interests(self, value: Any) -> Optional[List[str]]:
         """
-        Parse les intérêts depuis différents formats
+        Parse interests pour PostgreSQL (array format)
         """
-        value = self._clean_nan_values(value)
-        if value is None:
+        if not value or self._safe_isna(value):
             return None
         
-        if isinstance(value, list):
-            # Clean any NaN values from the list
-            cleaned_list = []
-            for item in value:
-                if not self._safe_isna(item):
-                    cleaned_list.append(str(item))
-            return cleaned_list if cleaned_list else None
-        
-        if isinstance(value, str):
-            value = value.strip()
-            if not value or value.lower() in ['nan', 'none', 'null']:
-                return None
-            # Try to parse comma-separated values
-            if ',' in value:
-                items = [item.strip() for item in value.split(',') if item.strip()]
-                return items if items else None
-            else:
-                return [value] if value else None
-        
-        return None
+        try:
+            # Si c'est déjà une liste
+            if isinstance(value, list):
+                return [str(item) for item in value if item and not self._safe_isna(item)]
+            
+            # Si c'est une string JSON
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                    if isinstance(parsed, list):
+                        return [str(item) for item in parsed if item]
+                except:
+                    # Si ce n'est pas du JSON, traiter comme string délimitée
+                    if ',' in value:
+                        return [item.strip() for item in value.split(',') if item.strip()]
+                    elif value.strip():
+                        return [value.strip()]
+            
+            return None
+            
+        except Exception:
+            return None
     
     def _normalize_status(self, value: Any) -> UserStatus:
         """
-        Normalise le statut utilisateur
+        Normalise le status pour PostgreSQL enum
         """
-        value = self._clean_nan_values(value)
-        if value is None:
+        if not value or self._safe_isna(value):
             return UserStatus.ACTIVE
         
-        status_str = str(value).upper().strip()
-        
-        # Map different status variations
-        status_mapping = {
-            'ACTIVE': UserStatus.ACTIVE,
-            'ACTIF': UserStatus.ACTIVE,
-            'ENABLED': UserStatus.ACTIVE,
-            'INACTIVE': UserStatus.INACTIVE,
-            'INACTIF': UserStatus.INACTIVE,
-            'DISABLED': UserStatus.INACTIVE,
-            'BANNED': UserStatus.BANNED,
-            'BANNI': UserStatus.BANNED,
-            'BLOCKED': UserStatus.BANNED
-        }
-        
-        return status_mapping.get(status_str, UserStatus.ACTIVE)
+        try:
+            status_str = str(value).upper().strip()
+            
+            # Mapping des valeurs courantes
+            status_mapping = {
+                'ACTIVE': UserStatus.ACTIVE,
+                'INACTIVE': UserStatus.INACTIVE,
+                'BANNED': UserStatus.BANNED,
+                'DISABLED': UserStatus.INACTIVE,
+                'SUSPENDED': UserStatus.BANNED,
+                'BLOCKED': UserStatus.BANNED,
+                '1': UserStatus.ACTIVE,
+                '0': UserStatus.INACTIVE,
+                'TRUE': UserStatus.ACTIVE,
+                'FALSE': UserStatus.INACTIVE
+            }
+            
+            return status_mapping.get(status_str, UserStatus.ACTIVE)
+            
+        except Exception:
+            return UserStatus.ACTIVE
     
     def _clean_string_field(self, value: Any) -> Optional[str]:
         """
-        Nettoie les champs string en gérant les valeurs NaN et les arrays
+        Nettoie les champs string pour PostgreSQL
         """
-        value = self._clean_nan_values(value)
-        if value is None:
+        if not value or self._safe_isna(value):
             return None
         
-        # Si c'est un array/list, prendre le premier élément non-null
-        if isinstance(value, (list, np.ndarray)):
-            try:
-                for item in value:
-                    if not self._safe_isna(item):
-                        value = item
-                        break
-                else:
-                    return None
-            except:
-                return None
-        
-        # Convert to string and strip whitespace
         try:
-            str_value = str(value).strip()
+            cleaned = str(value).strip()
+            return cleaned if cleaned else None
         except:
             return None
+
+    def enrich_user_data_with_auth(self, raw_user: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enrichit les données d'un utilisateur avec les informations d'authentification
+        Optimisé pour PostgreSQL
+        """
+        enriched_user = raw_user.copy()
         
-        # Return None for empty strings or common null representations
-        if not str_value or str_value.lower() in ['nan', 'null', 'none', '', 'nat']:
-            return None
+        # Email: priorité aux données auth
+        if 'auth_email' in raw_user and raw_user['auth_email']:
+            enriched_user['email'] = raw_user['auth_email']
+            enriched_user['email_source'] = 'auth'
+        elif 'email' in raw_user and raw_user['email']:
+            enriched_user['email_source'] = 'raw'
+        else:
+            enriched_user['email_source'] = 'none'
         
-        return str_value
-    
+        # Email verified: priorité aux données auth
+        if 'auth_email_verified' in raw_user:
+            enriched_user['emailVerified'] = bool(raw_user['auth_email_verified'])
+            enriched_user['email_verified_source'] = 'auth'
+        elif 'emailVerified' in raw_user:
+            enriched_user['email_verified_source'] = 'raw'
+        else:
+            enriched_user['emailVerified'] = False
+            enriched_user['email_verified_source'] = 'default'
+        
+        # Provider: priorité aux données auth avec conversion password -> CREDENTIALS
+        if 'auth_provider' in raw_user and raw_user['auth_provider']:
+            provider = raw_user['auth_provider']
+            # Convertir 'password' en 'CREDENTIALS'
+            if provider == 'password':
+                enriched_user['provider'] = 'CREDENTIALS'
+            else:
+                enriched_user['provider'] = provider
+            enriched_user['provider_source'] = 'auth'
+        elif 'provider' in raw_user and raw_user['provider']:
+            provider = raw_user['provider']
+            # Convertir 'password' en 'CREDENTIALS'
+            if provider == 'password':
+                enriched_user['provider'] = 'CREDENTIALS'
+            else:
+                enriched_user['provider'] = provider
+            enriched_user['provider_source'] = 'raw'
+        else:
+            enriched_user['provider'] = 'CREDENTIALS'
+            enriched_user['provider_source'] = 'default'
+        
+        # Dates: utiliser auth si disponible
+        if 'auth_created_at' in raw_user and raw_user['auth_created_at']:
+            enriched_user['createdAt'] = raw_user['auth_created_at']
+            enriched_user['created_at_source'] = 'auth'
+        elif 'createdAt' in raw_user:
+            enriched_user['created_at_source'] = 'raw'
+        else:
+            enriched_user['created_at_source'] = 'default'
+        
+        # Last sign in depuis auth
+        if 'auth_last_sign_in' in raw_user and raw_user['auth_last_sign_in']:
+            enriched_user['lastConnexion'] = raw_user['auth_last_sign_in']
+            enriched_user['last_connexion_source'] = 'auth'
+        elif 'lastConnexion' in raw_user:
+            enriched_user['last_connexion_source'] = 'raw'
+        else:
+            enriched_user['last_connexion_source'] = 'none'
+        
+        # Statut disabled depuis auth
+        if 'auth_disabled' in raw_user:
+            if raw_user['auth_disabled']:
+                enriched_user['status'] = 'INACTIVE'
+                enriched_user['status_source'] = 'auth_disabled'
+            elif 'status' in raw_user:
+                enriched_user['status_source'] = 'raw'
+            else:
+                enriched_user['status'] = 'ACTIVE'
+                enriched_user['status_source'] = 'default'
+        
+        # Marquer si l'utilisateur a des données auth
+        enriched_user['has_auth_data'] = bool('auth_email' in raw_user and raw_user['auth_email'])
+        
+        return enriched_user
+
+    def _prepare_for_postgres(self, user_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Prépare un dictionnaire utilisateur pour l'insertion PostgreSQL
+        """
+        postgres_user = {}
+        
+        # Champs requis avec nettoyage
+        postgres_user['id'] = self._clean_string_field(user_dict.get('id')) or str(uuid.uuid4())[:20]
+        postgres_user['email'] = self._clean_string_field(user_dict.get('email', ''))
+        
+        # Champs booléens
+        postgres_user['emailVerified'] = bool(user_dict.get('emailVerified', False))
+        postgres_user['phoneVerified'] = bool(user_dict.get('phoneVerified', False))
+        
+        # Champs string optionnels
+        string_fields = ['password', 'uid', 'provider', 'profilePic', 'phoneNumber', 'name', 'city', 'photo']
+        for field in string_fields:
+            postgres_user[field] = self._clean_string_field(user_dict.get(field))
+        
+        # Provider: nettoyer et convertir 'password' en 'CREDENTIALS'
+        provider = postgres_user.get('provider')
+        if provider == 'password':
+            postgres_user['provider'] = 'CREDENTIALS'
+            print(f"🔧 Converted provider 'password' to 'CREDENTIALS' for user {postgres_user.get('id', 'unknown')}")
+        elif not provider:
+            postgres_user['provider'] = 'CREDENTIALS'
+        
+        # Champs datetime avec gestion des erreurs PostgreSQL
+        postgres_user['createdAt'] = self._parse_datetime(user_dict.get('createdAt')) or datetime.now()
+        postgres_user['updatedAt'] = self._parse_datetime(user_dict.get('updatedAt')) or datetime.now()
+        postgres_user['birthdate'] = self._parse_datetime(user_dict.get('birthdate'))
+        postgres_user['lastConnexion'] = self._parse_datetime(user_dict.get('lastConnexion'))
+        
+        # Status enum
+        postgres_user['status'] = self._normalize_status(user_dict.get('status'))
+        
+        # Interests array pour PostgreSQL
+        postgres_user['interests'] = self._parse_interests(user_dict.get('interests'))
+        
+        # Validation finale - s'assurer que les champs requis sont présents
+        if not postgres_user['email']:
+            raise ValueError(f"Email is required for user {postgres_user['id']}")
+        
+        return postgres_user
+
     def detect_and_remove_duplicates(self, df: pd.DataFrame, 
                                    duplicate_column: str = 'email', 
                                    sort_column: str = 'createdAt',
                                    keep: str = 'last') -> pd.DataFrame:
         """
-        Détecte et supprime les doublons dans le DataFrame
+        Détecte et supprime les doublons avec statistiques
         """
         initial_count = len(df)
         
-        # Clean the duplicate column first
-        if duplicate_column in df.columns:
-            df[duplicate_column] = df[duplicate_column].apply(self._clean_string_field)
-            # Remove rows where the duplicate column is None
-            df = df.dropna(subset=[duplicate_column])
+        if duplicate_column not in df.columns:
+            print(f"⚠️  Column '{duplicate_column}' not found for duplicate detection")
+            return df
         
-        # Detect duplicates
-        duplicates = df[df.duplicated([duplicate_column], keep=False)]
+        # Identifier les doublons
+        duplicates_mask = df.duplicated(subset=[duplicate_column], keep=False)
+        duplicates_found = duplicates_mask.sum()
         
-        if not duplicates.empty:
-            print(f"⚠️  Found {len(duplicates)} duplicate {duplicate_column} values:")
-            
-            # Store duplication stats
-            duplicate_stats = {}
-            for value in duplicates[duplicate_column].unique():
-                dupes = duplicates[duplicates[duplicate_column] == value]
-                duplicate_count = len(dupes)
-                duplicate_stats[value] = {
-                    'count': duplicate_count,
-                    'ids': dupes['id'].tolist() if 'id' in dupes.columns else []
-                }
-                print(f"  - {value}: {duplicate_count} records")
-                if 'id' in dupes.columns:
-                    print(f"    IDs: {dupes['id'].tolist()}")
-            
+        if duplicates_found == 0:
+            print("✅ No duplicates found")
             self.deduplication_stats = {
-                'duplicates_found': len(duplicates),
-                'unique_duplicate_values': len(duplicate_stats),
-                'duplicate_details': duplicate_stats
-            }
-            
-            if keep != 'all':
-                print(f"🧹 Removing duplicates, keeping {keep} record per {duplicate_column}...")
-                
-                # Try to sort by the specified column
-                if sort_column in df.columns:
-                    print(f"Sorting by '{sort_column}' column...")
-                    df_copy = df.copy()
-                    df_copy['_sort_parsed'] = df_copy[sort_column].apply(self._parse_datetime)
-                    
-                    valid_dates = df_copy['_sort_parsed'].notna().sum()
-                    print(f"Successfully parsed {valid_dates} out of {len(df_copy)} dates")
-                    
-                    df_copy = df_copy.sort_values('_sort_parsed', na_position='first')
-                    df_deduplicated = df_copy.drop_duplicates([duplicate_column], keep=keep)
-                    df_deduplicated = df_deduplicated.drop('_sort_parsed', axis=1)
-                else:
-                    print(f"Column '{sort_column}' not found, using original order")
-                    df_deduplicated = df.drop_duplicates([duplicate_column], keep=keep)
-                
-                final_count = len(df_deduplicated)
-                removed_count = initial_count - final_count
-                
-                print(f"✓ After deduplication: {final_count} unique records")
-                print(f"✓ Removed {removed_count} duplicate records")
-                
-                self.deduplication_stats.update({
-                    'initial_count': initial_count,
-                    'final_count': final_count,
-                    'removed_count': removed_count,
-                    'deduplication_method': f"keep_{keep}_by_{sort_column}"
-                })
-                
-                return df_deduplicated
-            else:
-                print("Keeping all duplicates as requested")
-                return df
-        else:
-            print(f"✓ No duplicates found in '{duplicate_column}' column")
-            self.deduplication_stats = {
-                'duplicates_found': 0,
                 'initial_count': initial_count,
-                'final_count': initial_count,
-                'removed_count': 0
+                'duplicates_found': 0,
+                'removed_count': 0,
+                'final_count': initial_count
             }
             return df
-    
+        
+        print(f"🔍 Found {duplicates_found} duplicate entries based on '{duplicate_column}'")
+        
+        # Trier pour garder le bon enregistrement
+        if sort_column in df.columns:
+            df_sorted = df.sort_values(sort_column, ascending=True)
+        else:
+            df_sorted = df
+        
+        # Supprimer les doublons
+        df_cleaned = df_sorted.drop_duplicates(subset=[duplicate_column], keep=keep)
+        
+        removed_count = initial_count - len(df_cleaned)
+        
+        print(f"🧹 Removed {removed_count} duplicate entries, keeping '{keep}' occurrence")
+        
+        # Statistiques de déduplication
+        self.deduplication_stats = {
+            'initial_count': initial_count,
+            'duplicates_found': duplicates_found,
+            'removed_count': removed_count,
+            'final_count': len(df_cleaned),
+            'duplicate_column': duplicate_column,
+            'keep_strategy': keep
+        }
+        
+        return df_cleaned
+
     def transform_single_user(self, raw_user: Dict[str, Any]) -> Optional[UserModel]:
         """
         Transforme un utilisateur brut en UserModel
         """
         try:
-            # Mapping des champs avec transformation et nettoyage des NaN
-            transformed_data = {
-                'id': self._clean_string_field(raw_user.get('id', '')),
-                'email': self._clean_string_field(raw_user.get('email', '')),
-                'emailVerified': bool(raw_user.get('emailVerified', False)),
-                'password': self._clean_string_field(raw_user.get('password')),
-                'uid': self._clean_string_field(raw_user.get('uid')),
-                'provider': self._clean_string_field(raw_user.get('provider', 'CREDENTIALS')),
-                'profilePic': self._clean_string_field(raw_user.get('profilePic') or raw_user.get('profile_pic')),
-                'phoneNumber': self._clean_string_field(raw_user.get('phoneNumber') or raw_user.get('phone_number')),
-                'phoneVerified': bool(raw_user.get('phoneVerified', False)),
-                'name': self._clean_string_field(raw_user.get('name') or raw_user.get('displayName')),
-                'city': self._clean_string_field(raw_user.get('city')),
-                'birthdate': self._parse_datetime(raw_user.get('birthDate') or raw_user.get('birth_date')),
-                'photo': self._clean_string_field(raw_user.get('photo') or raw_user.get('photoURL')),
-                'createdAt': self._parse_datetime(raw_user.get('createdAt') or raw_user.get('created_at')) or datetime.now(),
-                'updatedAt': self._parse_datetime(raw_user.get('updatedAt') or raw_user.get('updated_at')) or datetime.now(),
-                'status': self._normalize_status(raw_user.get('status')),
-                'interests': self._parse_interests(raw_user.get('interests')),
-                'lastConnexion': self._parse_datetime(raw_user.get('lastConnexion') or raw_user.get('last_connexion'))
-            }
+            # Nettoyer les valeurs NaN
+            cleaned_user = {k: self._clean_nan_values(v) for k, v in raw_user.items()}
             
-            # Special handling for users without email (Google provider)
-            if not transformed_data['email'] and raw_user.get('provider') == 'google.com':
-                transformed_data['email'] = f"google_user_{raw_user.get('uid', 'unknown')}@placeholder.com"
-                print(f"⚠️  Generated placeholder email for Google user: {transformed_data['email']}")
+            # Préparer pour PostgreSQL
+            postgres_ready_user = self._prepare_for_postgres(cleaned_user)
             
-            # Ensure required fields have values
-            if not transformed_data['id']:
-                transformed_data['id'] = str(uuid.uuid4())[:20]
+            # Créer le UserModel
+            user_model = UserModel(**postgres_ready_user)
             
-            if not transformed_data['email']:
-                raise ValueError("Email is required but missing")
-            
-            if not transformed_data['provider']:
-                transformed_data['provider'] = 'CREDENTIALS'
-            
-            user_model = UserModel(**transformed_data)
             self.successful_transformations += 1
             return user_model
-            
-        except ValidationError as e:
-            self.failed_transformations += 1
-            error_info = {
-                'user_id': raw_user.get('id', 'unknown'),
-                'error': str(e),
-                'provider': raw_user.get('provider', 'unknown'),
-                'has_email': bool(raw_user.get('email')),
-                'raw_data_keys': list(raw_user.keys())
-            }
-            self.transformation_errors.append(error_info)
-            print(f"❌ Validation error for user {error_info['user_id']}: {str(e)}")
-            return None
             
         except Exception as e:
             self.failed_transformations += 1
             error_info = {
-                'user_id': raw_user.get('id', 'unknown'),
-                'error': f"Unexpected error: {str(e)}",
-                'provider': raw_user.get('provider', 'unknown'),
-                'has_email': bool(raw_user.get('email')),
-                'raw_data_keys': list(raw_user.keys())
+                'user_id': raw_user.get('id', raw_user.get('uid', 'unknown')),
+                'error': str(e),
+                'user_data': raw_user
             }
             self.transformation_errors.append(error_info)
-            print(f"❌ Transformation error for user {error_info['user_id']}: {str(e)}")
             return None
-    
-    def transform_users_dataframe(self, df: pd.DataFrame, remove_duplicates: bool = True) -> pd.DataFrame:
+
+    def join_users_and_auth_data(self, raw_users_df: pd.DataFrame, auth_users_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transforme un DataFrame d'utilisateurs bruts en DataFrame de UserModel
+        Joint les données des utilisateurs (raw_users) avec les données d'authentification (auth_users)
+        basé sur l'UID
+        """
+        print(f"🔗 Starting join between raw users ({len(raw_users_df)}) and auth users ({len(auth_users_df)})...")
+        
+        if raw_users_df.empty:
+            print("❌ Raw users DataFrame is empty")
+            return pd.DataFrame()
+        
+        if auth_users_df.empty:
+            print("⚠️  Auth users DataFrame is empty, proceeding with raw users only")
+            self.join_stats = {
+                'raw_users_count': len(raw_users_df),
+                'auth_users_count': 0,
+                'matched_users': 0,
+                'unmatched_raw_users': len(raw_users_df),
+                'unmatched_auth_users': 0,
+                'final_count': len(raw_users_df)
+            }
+            return raw_users_df
+        
+        # Nettoyer les UIDs pour la jointure
+        raw_users_clean = raw_users_df.copy()
+        auth_users_clean = auth_users_df.copy()
+        
+        # S'assurer que les colonnes UID existent et sont propres
+        if 'uid' not in raw_users_clean.columns:
+            print("⚠️  No 'uid' column in raw users, trying 'id' column...")
+            if 'id' in raw_users_clean.columns:
+                raw_users_clean['uid'] = raw_users_clean['id']
+            else:
+                print("❌ No UID column found in raw users")
+                return raw_users_df
+        
+        if 'uid' not in auth_users_clean.columns:
+            print("❌ No 'uid' column in auth users")
+            return raw_users_df
+        
+        # Nettoyer les UIDs
+        raw_users_clean['uid'] = raw_users_clean['uid'].apply(self._clean_string_field)
+        auth_users_clean['uid'] = auth_users_clean['uid'].apply(self._clean_string_field)
+        
+        # Supprimer les lignes avec UID null
+        raw_users_clean = raw_users_clean.dropna(subset=['uid'])
+        auth_users_clean = auth_users_clean.dropna(subset=['uid'])
+        
+        print(f"📊 After cleaning UIDs: Raw users: {len(raw_users_clean)}, Auth users: {len(auth_users_clean)}")
+        
+        # Préfixer les colonnes auth pour éviter les conflits (sauf uid)
+        auth_columns_to_rename = {col: f"auth_{col}" for col in auth_users_clean.columns if col != 'uid'}
+        auth_users_renamed = auth_users_clean.rename(columns=auth_columns_to_rename)
+        
+        print(f"📝 Auth columns renamed: {list(auth_columns_to_rename.values())}")
+        
+        # Effectuer la jointure LEFT JOIN (garder tous les raw users)
+        joined_df = raw_users_clean.merge(
+            auth_users_renamed,
+            on='uid',
+            how='left',
+            suffixes=('', '_auth_duplicate')
+        )
+        
+        # Statistiques de jointure
+        matched_users = joined_df['auth_email'].notna().sum()
+        unmatched_raw_users = len(joined_df) - matched_users
+        unmatched_auth_users = len(auth_users_clean) - matched_users
+        
+        self.join_stats = {
+            'raw_users_count': len(raw_users_df),
+            'auth_users_count': len(auth_users_df),
+            'raw_users_with_uid': len(raw_users_clean),
+            'auth_users_with_uid': len(auth_users_clean),
+            'matched_users': matched_users,
+            'unmatched_raw_users': unmatched_raw_users,
+            'unmatched_auth_users': unmatched_auth_users,
+            'final_count': len(joined_df),
+            'join_type': 'LEFT JOIN on uid'
+        }
+        
+        print(f"✅ Join completed successfully!")
+        print(f"📊 Join Statistics:")
+        print(f"   - Raw users processed: {len(raw_users_clean)}")
+        print(f"   - Auth users processed: {len(auth_users_clean)}")
+        print(f"   - Matched users: {matched_users}")
+        print(f"   - Raw users without auth data: {unmatched_raw_users}")
+        print(f"   - Auth users without raw data: {unmatched_auth_users}")
+        print(f"   - Final dataset size: {len(joined_df)}")
+        
+        return joined_df
+    
+    def transform_users_dataframe(self, raw_users_df: pd.DataFrame, auth_users_df: pd.DataFrame = None, remove_duplicates: bool = True) -> pd.DataFrame:
+        """
+        Transforme un DataFrame d'utilisateurs bruts en DataFrame prêt pour PostgreSQL
         """
         self._reset_counters()
         
-        print(f"🔄 Starting transformation of {len(df)} users...")
+        print(f"🔄 Starting transformation of {len(raw_users_df)} users for PostgreSQL...")
         
-        # Step 1: Clean DataFrame - replace NaN with None de manière sécurisée
-        print("🧹 Cleaning NaN values...")
-        df_cleaned = df.copy()
+        # Step 1: Jointure avec les données auth si disponibles
+        if auth_users_df is not None and not auth_users_df.empty:
+            print("\n=== Joining raw users with auth data ===")
+            df_joined = self.join_users_and_auth_data(raw_users_df, auth_users_df)
+        else:
+            print("⚠️  No auth data provided, proceeding with raw users only")
+            df_joined = raw_users_df.copy()
+            self.join_stats = {
+                'raw_users_count': len(raw_users_df),
+                'auth_users_count': 0,
+                'matched_users': 0,
+                'final_count': len(raw_users_df)
+            }
         
-        # Nettoyage colonne par colonne pour éviter les erreurs d'ambiguïté
+        # Step 2: Clean DataFrame - replace NaN with None
+        print("\n🧹 Cleaning NaN values...")
+        df_cleaned = df_joined.copy()
+        
         for col in df_cleaned.columns:
             try:
-                # Appliquer le nettoyage sur chaque cellule individuellement
                 df_cleaned[col] = df_cleaned[col].apply(lambda x: self._clean_nan_values(x))
             except Exception as e:
                 print(f"⚠️  Warning: Could not clean column {col}: {e}")
-                # En cas d'erreur, essayer un nettoyage basique
                 df_cleaned[col] = df_cleaned[col].where(pd.notna(df_cleaned[col]), None)
         
-        # Step 2: Remove duplicates if requested
+        # Step 3: Remove duplicates if requested
         if remove_duplicates:
             print("\n=== Detecting and removing duplicates ===")
             df_cleaned = self.detect_and_remove_duplicates(df_cleaned)
         
-        # Step 3: Transform users
-        print(f"\n=== Transforming users to UserModel ===")
+        # Step 4: Transform users pour PostgreSQL
+        print(f"\n=== Transforming users for PostgreSQL ===")
         transformed_users = []
         
         for idx, row in df_cleaned.iterrows():
             raw_user = row.to_dict()
-            user_model = self.transform_single_user(raw_user)
+            
+            # Enrichir avec les données auth si disponibles
+            if auth_users_df is not None:
+                enriched_user = self.enrich_user_data_with_auth(raw_user)
+            else:
+                enriched_user = raw_user
+            
+            user_model = self.transform_single_user(enriched_user)
             
             if user_model:
+                # Convertir en dict - SANS les métadonnées pour PostgreSQL
                 user_dict = user_model.dict()
-                transformed_users.append(user_dict)
+                
+                # Ne PAS ajouter les métadonnées dans le dict final
+                # Les statistiques sont gardées dans transformation_report
+                
+                # Validation finale pour PostgreSQL
+                if user_dict.get('email'):  # S'assurer qu'on a un email valide
+                    transformed_users.append(user_dict)
+                else:
+                    print(f"⚠️  Skipping user {user_dict.get('id', 'unknown')} - no valid email")
             
             # Progress indicator
             if (idx + 1) % 100 == 0 or (idx + 1) == len(df_cleaned):
@@ -436,90 +566,160 @@ class UserTransformerService:
         
         result_df = pd.DataFrame(transformed_users)
         
-        print(f"✅ Transformation completed: {len(result_df)} users successfully transformed")
+        if not result_df.empty:
+            # Final cleaning pour PostgreSQL - supprime les métadonnées
+            print("\n🔧 Final PostgreSQL preparation...")
+            result_df = self._finalize_dataframe_for_postgres(result_df)
+        
+        print(f"✅ Transformation completed: {len(result_df)} users ready for PostgreSQL")
         
         return result_df
-    
-    def transform_users_list(self, users_list: List[Dict[str, Any]]) -> List[UserModel]:
+
+    def _finalize_dataframe_for_postgres(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transforme une liste d'utilisateurs bruts en liste de UserModel
+        Finalise le DataFrame pour l'insertion PostgreSQL
+        Supprime les colonnes de métadonnées qui ne sont pas dans le schéma de la table
         """
-        self._reset_counters()
+        df_final = df.copy()
         
-        transformed_users = []
-        for raw_user in users_list:
-            user_model = self.transform_single_user(raw_user)
-            if user_model:
-                transformed_users.append(user_model)
+        # Colonnes autorisées dans la table User PostgreSQL
+        allowed_columns = [
+            'id', 'email', 'emailVerified', 'password', 'uid', 'provider', 
+            'profilePic', 'phoneNumber', 'phoneVerified', 'name', 'city', 
+            'birthdate', 'photo', 'createdAt', 'updatedAt', 'status', 
+            'interests', 'lastConnexion'
+        ]
         
-        return transformed_users
-    
-    def _reset_counters(self):
-        """Reset les compteurs de transformation"""
-        self.transformation_errors = []
-        self.successful_transformations = 0
-        self.failed_transformations = 0
-        self.deduplication_stats = {}
-    
+        # Colonnes de métadonnées à supprimer avant insertion PostgreSQL
+        metadata_columns = [
+            'email_source', 'has_auth_data', 'email_verified_source', 
+            'provider_source', 'created_at_source', 'last_connexion_source', 
+            'status_source'
+        ]
+        
+        # Supprimer les colonnes de métadonnées
+        columns_to_drop = [col for col in metadata_columns if col in df_final.columns]
+        if columns_to_drop:
+            print(f"🧹 Removing metadata columns: {columns_to_drop}")
+            df_final = df_final.drop(columns=columns_to_drop)
+        
+        # Garder seulement les colonnes autorisées
+        final_columns = [col for col in df_final.columns if col in allowed_columns]
+        df_final = df_final[final_columns]
+        
+        print(f"✅ Final columns for PostgreSQL: {df_final.columns.tolist()}")
+        
+        # Convertir les enums en strings
+        if 'status' in df_final.columns:
+            df_final['status'] = df_final['status'].apply(lambda x: x.value if hasattr(x, 'value') else str(x))
+        
+        # Gérer les arrays pour PostgreSQL
+        if 'interests' in df_final.columns:
+            df_final['interests'] = df_final['interests'].apply(self._format_interests_for_postgres)
+        
+        # S'assurer que les datetime sont dans le bon format
+        datetime_columns = ['createdAt', 'updatedAt', 'birthdate', 'lastConnexion']
+        for col in datetime_columns:
+            if col in df_final.columns:
+                df_final[col] = pd.to_datetime(df_final[col], errors='coerce')
+        
+        # Validation finale - supprimer les lignes sans email valide
+        if 'email' in df_final.columns:
+            initial_count = len(df_final)
+            df_final = df_final[df_final['email'].notna() & (df_final['email'] != '')]
+            removed_count = initial_count - len(df_final)
+            if removed_count > 0:
+                print(f"⚠️  Removed {removed_count} users without valid email")
+        
+        return df_final
+
+    def _format_interests_for_postgres(self, interests: Any) -> Optional[str]:
+        """
+        Formate les interests pour PostgreSQL array
+        """
+        if not interests or self._safe_isna(interests):
+            return None
+        
+        try:
+            if isinstance(interests, list):
+                # Convertir en format PostgreSQL array
+                clean_interests = [str(item).strip() for item in interests if item and not self._safe_isna(item)]
+                if clean_interests:
+                    return '{' + ','.join(f'"{item}"' for item in clean_interests) + '}'
+            return None
+        except:
+            return None
+
+    def get_join_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques de jointure"""
+        return self.join_stats
+
     def get_transformation_report(self) -> Dict[str, Any]:
         """
-        Retourne un rapport détaillé de la transformation
+        Retourne un rapport détaillé de la transformation AVEC métadonnées
         """
         total = self.successful_transformations + self.failed_transformations
         success_rate = (self.successful_transformations / total * 100) if total > 0 else 0
         
+        # Calculer les statistiques de source depuis les données transformées
+        source_stats = {}
+        if hasattr(self, 'last_enriched_users'):
+            email_sources = {}
+            auth_data_count = 0
+            for user in self.last_enriched_users:
+                source = user.get('email_source', 'unknown')
+                email_sources[source] = email_sources.get(source, 0) + 1
+                if user.get('has_auth_data', False):
+                    auth_data_count += 1
+            
+            source_stats = {
+                'email_sources': email_sources,
+                'users_with_auth_data': auth_data_count,
+                'total_users': len(self.last_enriched_users)
+            }
+        print(f"source_stats={source_stats}")
         return {
             'successful_transformations': self.successful_transformations,
             'failed_transformations': self.failed_transformations,
             'success_rate': success_rate,
             'errors': self.transformation_errors,
-            'deduplication_stats': self.deduplication_stats
+            'deduplication_stats': self.deduplication_stats,
+            'join_stats': self.join_stats,
+            'source_stats': source_stats
         }
-    
+
     def export_transformed_users(self, users_df: pd.DataFrame, filename: str = 'transformed_users.csv') -> bool:
-        """
-        Exporte les utilisateurs transformés vers un fichier CSV
-        """
+        """Exporte les utilisateurs transformés"""
         try:
-            users_df.to_csv(filename, index=False, encoding='utf-8')
-            print(f"✅ Transformed users exported to: {filename}")
+            users_df.to_csv(filename, index=False)
+            print(f"✅ Exported {len(users_df)} users to {filename}")
             return True
         except Exception as e:
-            print(f"❌ Error exporting transformed users: {e}")
+            print(f"❌ Error exporting users: {e}")
             return False
     
     def validate_required_fields(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Valide la présence des champs requis dans le DataFrame
-        """
+        """Valide les champs requis pour PostgreSQL"""
         required_fields = ['id', 'email']
-        missing_fields = []
-        null_value_fields = []
+        
+        missing_fields = [field for field in required_fields if field not in df.columns]
+        null_values = {}
         
         for field in required_fields:
-            if field not in df.columns:
-                missing_fields.append(field)
-            else:
-                # Check for null/NaN values in required fields using safe method
-                null_count = 0
-                for val in df[field]:
-                    if self._safe_isna(val):
-                        null_count += 1
-                
+            if field in df.columns:
+                null_count = df[field].isnull().sum()
                 if null_count > 0:
-                    null_value_fields.append(f"{field} ({null_count} null values)")
+                    null_values[field] = null_count
         
-        is_valid = len(missing_fields) == 0 and len(null_value_fields) == 0
+        is_valid = len(missing_fields) == 0 and len(null_values) == 0
         
         return {
             'is_valid': is_valid,
             'missing_required_fields': missing_fields,
-            'null_values_in_required_fields': null_value_fields,
-            'total_records': len(df)
+            'null_values_in_required_fields': null_values,
+            'total_rows': len(df)
         }
     
     def get_deduplication_stats(self) -> Dict[str, Any]:
-        """
-        Retourne les statistiques de déduplication
-        """
+        """Retourne les statistiques de déduplication"""
         return self.deduplication_stats

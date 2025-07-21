@@ -26,71 +26,71 @@ def main():
         transformer_service = UserTransformerService()
         postgres_service = PostgreSQLLoaderService()
         
-        # Debug database structure (optional)
-        firebase_service.debug_database_structure()
-        
         print("\n=== Extracting raw users from Firebase ===")
         
-        # Get all users as raw data
-        raw_users_df = firebase_service.get_all_users_raw()
-        
+        # Get all users as raw data using the new method
+        raw_users_df = firebase_service.get_raw_users()
         print(f"Raw users extracted: {len(raw_users_df)}")
+        
+        # Get auth data from Firebase
+        print(f"\n=== Extracting auth data from Firebase ===")
+        auth_users_df = firebase_service.get_auth_users()
+        print(f"Auth users extracted: {len(auth_users_df)}")
         
         if not raw_users_df.empty:
             print(f"\n=== Raw Data Info ===")
-            print(f"Columns: {raw_users_df.columns.tolist()}")
-            print(f"Data types: {raw_users_df.dtypes.to_dict()}")
+            print(f"Raw users columns: {raw_users_df.columns.tolist()}")
+            
+            if not auth_users_df.empty:
+                print(f"Auth users columns: {auth_users_df.columns.tolist()}")
             
             # Export raw data for backup
-            raw_backup_file = firebase_service.export_raw_data()
+            raw_backup_file = firebase_service.export_raw_data(raw_users_df, "raw_users_backup.json")
             print(f"Raw data backed up to: {raw_backup_file}")
             
-            # Show sample (first few rows)
-            print(f"\n=== Sample Raw Data ===")
-            print(raw_users_df.head())
+            if not auth_users_df.empty:
+                auth_backup_file = firebase_service.export_raw_data(auth_users_df, "auth_users_backup.json")
+                print(f"Auth data backed up to: {auth_backup_file}")
             
-            # ====== TRANSFORMATION PHASE ======
-            print(f"\n=== Starting Data Transformation ===")
+            # ====== TRANSFORMATION PHASE WITH JOIN ======
+            print(f"\n=== Starting Data Transformation with Join ===")
             
-            # Step 1: Validate required fields
-            validation_result = transformer_service.validate_required_fields(raw_users_df)
-            print(f"📋 Field validation result: {validation_result}")
-            
-            if not validation_result['is_valid']:
-                print("❌ Data validation failed!")
-                if validation_result['missing_required_fields']:
-                    print(f"Missing required fields: {validation_result['missing_required_fields']}")
-                if validation_result['null_values_in_required_fields']:
-                    print(f"Null values in required fields: {validation_result['null_values_in_required_fields']}")
-                
-                # Try to fix missing required fields
-                if 'id' in validation_result['missing_required_fields']:
-                    print("🔧 Generating missing IDs...")
-                    raw_users_df['id'] = raw_users_df.apply(lambda row: row.get('uid') or str(uuid.uuid4())[:20], axis=1)
-                
-                if 'email' in validation_result['missing_required_fields']:
-                    print("❌ Cannot proceed without email field")
-                    return
-            
-            # Step 2: Transform users with deduplication
-            print(f"\n🔄 Transforming {len(raw_users_df)} users...")
+            # Step 1: Transform users with auth data join
+            print(f"\n🔄 Transforming {len(raw_users_df)} raw users with {len(auth_users_df)} auth users...")
             transformed_users_df = transformer_service.transform_users_dataframe(
                 raw_users_df, 
+                auth_users_df,  # Passer les données auth
                 remove_duplicates=True
             )
             
             print(f"✅ Transformation completed!")
             print(f"Transformed users: {len(transformed_users_df)}")
             
-            # Step 3: Get transformation report
+            # Step 2: Get transformation report (incluant les stats de jointure)
             transformation_report = transformer_service.get_transformation_report()
             print(f"\n=== Transformation Report ===")
             print(f"✅ Successful transformations: {transformation_report['successful_transformations']}")
             print(f"❌ Failed transformations: {transformation_report['failed_transformations']}")
             print(f"📊 Success rate: {transformation_report['success_rate']:.2f}%")
             
+            # Afficher les statistiques de jointure
+            if transformation_report['join_stats']:
+                join_stats = transformation_report['join_stats']
+                print(f"\n=== Join Statistics ===")
+                print(f"🔗 Raw users: {join_stats.get('raw_users_count', 0)}")
+                print(f"🔐 Auth users: {join_stats.get('auth_users_count', 0)}")
+                print(f"✅ Matched users: {join_stats.get('matched_users', 0)}")
+                print(f"⚠️  Raw users without auth: {join_stats.get('unmatched_raw_users', 0)}")
+                print(f"⚠️  Auth users without raw data: {join_stats.get('unmatched_auth_users', 0)}")
+                
+                if join_stats.get('matched_users', 0) > 0:
+                    match_rate = (join_stats['matched_users'] / join_stats['raw_users_count']) * 100
+                    print(f"📈 Match rate: {match_rate:.2f}%")
+            
+            # Afficher les stats de déduplication
             if transformation_report['deduplication_stats']:
                 dedup_stats = transformation_report['deduplication_stats']
+                print(f"\n=== Deduplication Statistics ===")
                 print(f"🧹 Duplicates removed: {dedup_stats.get('removed_count', 0)}")
                 if dedup_stats.get('duplicates_found', 0) > 0:
                     print(f"🔍 Duplicate details: {dedup_stats.get('unique_duplicate_values', 0)} unique duplicate values")
@@ -103,21 +103,29 @@ def main():
                 if len(transformation_report['errors']) > 5:
                     print(f"  ... and {len(transformation_report['errors']) - 5} more errors")
             
-            # Step 4: Show transformed data info
+            # Step 3: Show transformed data info
             if not transformed_users_df.empty:
                 print(f"\n=== Transformed Data Info ===")
                 print(f"Columns: {transformed_users_df.columns.tolist()}")
-                print(f"Data types: {transformed_users_df.dtypes.to_dict()}")
+                
+                # Statistiques sur les sources de données
+                if 'email_source' in transformed_users_df.columns:
+                    email_sources = transformed_users_df['email_source'].value_counts()
+                    print(f"📧 Email sources: {email_sources.to_dict()}")
+                
+                if 'has_auth_data' in transformed_users_df.columns:
+                    auth_data_count = transformed_users_df['has_auth_data'].sum()
+                    print(f"🔐 Users with auth data: {auth_data_count}/{len(transformed_users_df)}")
                 
                 # Show sample transformed data
                 print(f"\n=== Sample Transformed Data ===")
                 print(transformed_users_df.head())
                 
-                # Step 5: Export transformed data
+                # Step 4: Export transformed data
                 print(f"\n📦 Exporting transformed data...")
                 from datetime import datetime
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                transformed_filename = f"transformed_users_{timestamp}.csv"
+                transformed_filename = f"transformed_users_joined_{timestamp}.csv"
                 
                 export_success = transformer_service.export_transformed_users(
                     transformed_users_df, 
@@ -130,7 +138,7 @@ def main():
                 # ====== LOADING PHASE ======
                 print(f"\n=== Starting Data Loading to PostgreSQL ===")
                 
-                # Step 6: Load to PostgreSQL
+                # Step 6: Load to PostgreSQL with batch processing
                 try:
                     # Initialize PostgreSQL service here if not already done
                     if 'postgres_service' not in locals():
@@ -156,11 +164,17 @@ def main():
                     if conflict_count > 0:
                         print(f"🔧 Resolved {conflict_count} ID conflicts by generating new IDs")
                     
-                    # Load users to PostgreSQL
-                    load_result = postgres_service.load_users_dataframe(transformed_users_df)
+                    # Load users to PostgreSQL with batch processing
+                    print(f"\n🚀 Starting batch loading to PostgreSQL...")
+                    load_result = postgres_service.load_users_dataframe(
+                        transformed_users_df, 
+                        use_batch=True  # Utiliser le batch loading
+                    )
                     
                     if load_result['success']:
                         print(f"✅ Successfully loaded {load_result['inserted_count']} users to PostgreSQL")
+                        print(f"📦 Used batch size: {load_result.get('batch_size_used', 'N/A')}")
+                        
                         if load_result['failed_count'] > 0:
                             print(f"⚠️  {load_result['failed_count']} users failed to load")
                             

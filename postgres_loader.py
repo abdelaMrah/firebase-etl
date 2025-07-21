@@ -25,6 +25,10 @@ class PostgreSQLLoaderService:
             self.db_user = os.getenv('POSTGRES_USER', 'user')
             self.db_password = os.getenv('POSTGRES_PASSWORD', 'password')
             
+            # Get batch size from environment
+            self.batch_size = int(os.getenv('POSTGRES_BATCH_SIZE', '1000'))
+            print(f"🔧 PostgreSQL batch size: {self.batch_size}")
+            
             # Create connection string
             self.connection_string = f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
             
@@ -325,11 +329,81 @@ class PostgreSQLLoaderService:
                 
                 conn.execute(text(query), clean_params)
 
+    def _insert_batch_users(self, users_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Insère un batch d'utilisateurs avec gestion d'erreurs
+        """
+        batch_result = {
+            'inserted_count': 0,
+            'failed_count': 0,
+            'errors': []
+        }
+        
+        try:
+            with self.engine.connect() as conn:
+                with conn.begin():  # Transaction pour tout le batch
+                    for user_data in users_batch:
+                        try:
+                            # Préparer les données pour l'insertion
+                            columns = []
+                            placeholders = []
+                            clean_params = {}
+                            
+                            for key, value in user_data.items():
+                                cleaned_value = self._final_clean_value(value)
+                                
+                                if cleaned_value is not None:
+                                    columns.append(f'"{key}"')
+                                    placeholders.append(f':{key}')
+                                    clean_params[key] = cleaned_value
+                            
+                            if not columns:
+                                raise ValueError("No valid data to insert")
+                            
+                            query = f"""
+                                INSERT INTO public."User" ({', '.join(columns)})
+                                VALUES ({', '.join(placeholders)})
+                            """
+                            
+                            conn.execute(text(query), clean_params)
+                            batch_result['inserted_count'] += 1
+                            
+                        except Exception as e:
+                            batch_result['failed_count'] += 1
+                            error_info = {
+                                'user_id': user_data.get('id', 'unknown'),
+                                'error': str(e)
+                            }
+                            batch_result['errors'].append(error_info)
+                            
+        except Exception as e:
+            # Si toute la transaction échoue, marquer tous comme échec
+            print(f"❌ Batch transaction failed: {e}")
+            batch_result['failed_count'] = len(users_batch)
+            batch_result['inserted_count'] = 0
+            batch_result['errors'] = [{'batch_error': str(e)}]
+        
+        return batch_result
+
     def _prepare_dataframe_for_insertion(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Prépare le DataFrame pour l'insertion en PostgreSQL (deprecated - use _clean_dataframe_for_postgres)
+        Prépare le DataFrame pour l'insertion en filtrant les colonnes non-DB
         """
-        return self._clean_dataframe_for_postgres(df)
+        # Colonnes autorisées dans la table User
+        allowed_columns = [
+            'id', 'email', 'emailVerified', 'password', 'uid', 'provider', 
+            'profilePic', 'phoneNumber', 'phoneVerified', 'name', 'city', 
+            'birthdate', 'photo', 'createdAt', 'updatedAt', 'status', 
+            'interests', 'lastConnexion'
+        ]
+        
+        # Filtrer les colonnes
+        available_columns = [col for col in allowed_columns if col in df.columns]
+        df_filtered = df[available_columns].copy()
+        
+        print(f"🔧 Filtered DataFrame columns: {df_filtered.columns.tolist()}")
+        
+        return self._clean_dataframe_for_postgres(df_filtered)
 
     def _format_array_for_postgres(self, value) -> Optional[str]:
         """
@@ -521,16 +595,20 @@ class PostgreSQLLoaderService:
             print(f"❌ Error cleaning duplicates: {e}")
             return {'error': str(e)}
 
-    def load_users_dataframe(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def load_users_dataframe(self, df: pd.DataFrame, use_batch: bool = True) -> Dict[str, Any]:
         """
-        Charge un DataFrame d'utilisateurs dans PostgreSQL avec gestion d'erreurs
+        Charge un DataFrame d'utilisateurs dans PostgreSQL avec insertion par batch ou individuelle
+        
+        Args:
+            df: DataFrame à charger
+            use_batch: Si True, utilise l'insertion par batch. Si False, insertion individuelle.
         """
         try:
             print(f"🔄 Starting to load {len(df)} users to PostgreSQL...")
+            print(f"🔧 Using {'batch' if use_batch else 'individual'} insertion mode (batch size: {self.batch_size})")
             
-            # Check if table exists (using existing method)
+            # Check if table exists
             if not self.check_table_exists():
-                # Try to create table if it doesn't exist
                 try:
                     self.create_user_table()
                 except:
@@ -543,8 +621,8 @@ class PostgreSQLLoaderService:
                         'errors': []
                     }
             
-            # Clean dataframe for PostgreSQL
-            df_clean = self._clean_dataframe_for_postgres(df)
+            # Prepare dataframe for PostgreSQL
+            df_clean = self._prepare_dataframe_for_insertion(df)
             
             # Track statistics
             total_processed = len(df_clean)
@@ -552,27 +630,71 @@ class PostgreSQLLoaderService:
             failed_count = 0
             errors = []
             
-            print("📝 Inserting users individually to handle errors gracefully...")
-            
-            # Insert users one by one to handle errors gracefully
-            for idx, row in df_clean.iterrows():
-                try:
-                    user_data = row.to_dict()
-                    self._insert_single_user(user_data)
-                    inserted_count += 1
+            if use_batch and self.batch_size > 1:
+                print(f"📦 Processing {total_processed} users in batches of {self.batch_size}...")
+                
+                # Process in batches
+                for i in range(0, total_processed, self.batch_size):
+                    batch_start = i
+                    batch_end = min(i + self.batch_size, total_processed)
+                    batch_df = df_clean.iloc[batch_start:batch_end]
                     
-                    # Progress indicator
-                    if (idx + 1) % 100 == 0 or (idx + 1) == len(df_clean):
-                        print(f"📝 Processed {idx + 1}/{len(df_clean)} users... (Success: {inserted_count}, Failed: {failed_count})")
+                    print(f"📝 Processing batch {batch_start//self.batch_size + 1}/{(total_processed-1)//self.batch_size + 1} ({batch_start+1}-{batch_end}/{total_processed})...")
+                    
+                    # Convert batch to list of dicts
+                    batch_users = batch_df.to_dict('records')
+                    
+                    # Insert batch
+                    batch_result = self._insert_batch_users(batch_users)
+                    
+                    # Update counters
+                    inserted_count += batch_result['inserted_count']
+                    failed_count += batch_result['failed_count']
+                    errors.extend(batch_result['errors'])
+                    
+                    print(f"📊 Batch result: {batch_result['inserted_count']} inserted, {batch_result['failed_count']} failed")
+                    
+                    # Si le batch échoue complètement, passer en mode individuel pour ce batch
+                    if batch_result['inserted_count'] == 0 and len(batch_result['errors']) == 1 and 'batch_error' in batch_result['errors'][0]:
+                        print("⚠️  Batch failed, retrying individual insertions for this batch...")
+                        failed_count -= batch_result['failed_count']  # Reset failed count
+                        errors = errors[:-1]  # Remove batch error
                         
-                except Exception as e:
-                    failed_count += 1
-                    error_info = {
-                        'user_id': user_data.get('id', 'unknown'),
-                        'error': str(e)
-                    }
-                    errors.append(error_info)
-                    print(f"❌ Failed to insert user {user_data.get('id', 'unknown')}: {e}")
+                        # Retry individual insertions for failed batch
+                        for idx, row in batch_df.iterrows():
+                            try:
+                                user_data = row.to_dict()
+                                self._insert_single_user(user_data)
+                                inserted_count += 1
+                            except Exception as e:
+                                failed_count += 1
+                                error_info = {
+                                    'user_id': user_data.get('id', 'unknown'),
+                                    'error': str(e)
+                                }
+                                errors.append(error_info)
+                        
+            else:
+                print("📝 Processing users individually...")
+                
+                # Insert users one by one
+                for idx, row in df_clean.iterrows():
+                    try:
+                        user_data = row.to_dict()
+                        self._insert_single_user(user_data)
+                        inserted_count += 1
+                        
+                        # Progress indicator
+                        if (idx + 1) % 100 == 0 or (idx + 1) == len(df_clean):
+                            print(f"📝 Processed {idx + 1}/{len(df_clean)} users... (Success: {inserted_count}, Failed: {failed_count})")
+                            
+                    except Exception as e:
+                        failed_count += 1
+                        error_info = {
+                            'user_id': user_data.get('id', 'unknown'),
+                            'error': str(e)
+                        }
+                        errors.append(error_info)
             
             print("✅ Loading completed!")
             
@@ -588,7 +710,8 @@ class PostgreSQLLoaderService:
                 'inserted_count': inserted_count,
                 'failed_count': failed_count,
                 'errors': errors,
-                'database_stats': stats
+                'database_stats': stats,
+                'batch_size_used': self.batch_size if use_batch else 1
             }
             
         except Exception as e:
@@ -604,13 +727,13 @@ class PostgreSQLLoaderService:
                 'errors': []
             }
 
-    def load_users_list(self, users_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def load_users_list(self, users_list: List[Dict[str, Any]], use_batch: bool = True) -> Dict[str, Any]:
         """
         Charge une liste d'utilisateurs dans PostgreSQL
         """
         # Convert list to DataFrame and use the DataFrame method
         df = pd.DataFrame(users_list)
-        return self.load_users_dataframe(df)
+        return self.load_users_dataframe(df, use_batch=use_batch)
 
     def ensure_table_exists(self) -> bool:
         """
