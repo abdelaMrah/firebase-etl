@@ -117,3 +117,4 @@ dmypy.json
 Thumbs.db
 service-account-1.json
 *.json
+*.csv
